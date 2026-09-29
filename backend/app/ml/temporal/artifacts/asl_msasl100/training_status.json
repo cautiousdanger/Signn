@@ -1,0 +1,28 @@
+{
+  "dataset": "asl_msasl100",
+  "status": "ready",
+  "samples": 30,
+  "classes": [
+    "bird",
+    "deaf",
+    "eat",
+    "finish",
+    "friend",
+    "happy",
+    "like",
+    "mother",
+    "no",
+    "orange",
+    "sister",
+    "sit",
+    "teacher",
+    "tired",
+    "want",
+    "white"
+  ],
+  "train_accuracy": 0.7333,
+  "feature_dim": 30,
+  "onnx": true,
+  "updated_at": "2026-09-29T07:20:14.813571+00:00",
+  "note": "Trained Softmax on pooled MediaPipe hand features (16 classes)"
+}

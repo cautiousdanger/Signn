@@ -1,0 +1,2108 @@
+"""Gesture scoring engine for held poses and short motion sequences.
+
+Supports aviation (body pose) and sign_language (hand landmarks) modes.
+"""
+
+from __future__ import annotations
+
+from typing import Any, Literal
+
+import numpy as np
+from fastdtw import fastdtw
+
+from app.scoring.reference_gestures import MotionReference, PoseReference
+from app.scoring.sign_meanings import SIGN_MEANINGS
+
+WRIST_VISIBILITY_THRESHOLD = 0.3  # raised arms often drop MediaPipe visibility
+# HandLandmarker typically has no useful per-landmark visibility — use framing instead.
+HAND_MIN_BBOX_AREA = 0.008  # normalized image area; too small ≈ hand cut off / far
+HAND_EDGE_MARGIN = 0.02  # landmarks must stay inside [margin, 1-margin]
+SIGN_RECOGNITION_THRESHOLD = 0.55  # speak / mark correct at or above this
+SIGN_ATTEMPT_FEEDBACK_THRESHOLD = 0.35  # show live Incorrect / trying below match
+
+SIGN_POSE_GESTURES = (
+    "thumbs_up",
+    "thumbs_down",
+    "open_palm",
+    "fist",
+    "four",
+    "pointing",
+    "peace_sign",
+    "please",
+    "you",
+    "want",
+    "okay",
+    "i_love_you",
+    "i",
+    "food",
+    "water",
+    "direction",
+    "understood",
+    "doctor",
+    "sick",
+    "happy",
+    "today",
+    "tomorrow",
+)
+
+AviationClass = Literal["exit_pointing", "seatbelt_demo", "none"]
+SignClass = Literal[
+    "thumbs_up",
+    "thumbs_down",
+    "open_palm",
+    "fist",
+    "four",
+    "pointing",
+    "peace_sign",
+    "please",
+    "you",
+    "want",
+    "okay",
+    "i_love_you",
+    "i",
+    "food",
+    "water",
+    "direction",
+    "understood",
+    "doctor",
+    "sick",
+    "happy",
+    "today",
+    "tomorrow",
+    "wave",
+    "none",
+]
+
+# Two-hand AAC hold hints (shown while stabilizing).
+TWO_HAND_HOLD_HINTS: dict[str, str] = {
+    "i": "Hold both index fingers still for Help",
+    "fist": "Hold both thumbs sideways still for Clear",
+    "understood": "Hold both peace signs still for Understood",
+    "doctor": "Hold fist + open palm still for Doctor",
+    "sick": "Hold both fists still for Sick",
+    "happy": "Hold both thumbs up still for Happy",
+    "today": "Hold both open palms still for Today",
+    "tomorrow": "Hold both pinkies up still for Tomorrow",
+}
+GestureClass = AviationClass | SignClass
+
+HAND_LANDMARK_KEYS = (
+    "wrist",
+    "thumb_cmc",
+    "thumb_mcp",
+    "thumb_ip",
+    "thumb_tip",
+    "index_mcp",
+    "index_pip",
+    "index_dip",
+    "index_tip",
+    "middle_mcp",
+    "middle_pip",
+    "middle_dip",
+    "middle_tip",
+    "ring_mcp",
+    "ring_pip",
+    "ring_dip",
+    "ring_tip",
+    "pinky_mcp",
+    "pinky_pip",
+    "pinky_dip",
+    "pinky_tip",
+)
+
+# Exit pointing — multi-signal attempt (normalized to shoulder width).
+EXIT_HEIGHT_SLACK = 0.18  # wrist may sit slightly below shoulder line
+EXIT_MIN_SPREAD_RATIO = 0.75  # wrist lateral / shoulder_width
+EXIT_MIN_EXTENSION_RATIO = 0.85  # horizontal wrist–shoulder / upper-arm
+EXIT_ATTEMPT_THRESHOLD = 0.50
+EXIT_HOLD_THRESHOLD = 0.40  # keep classifying exit while holding (hysteresis)
+
+# Seatbelt — waist zone relative to torso.
+SEATBELT_MAX_WRIST_ABOVE_HIP = 0.16
+SEATBELT_MAX_WRIST_BELOW_HIP = 0.22
+SEATBELT_ATTEMPT_THRESHOLD = 0.45
+SEATBELT_HOLD_THRESHOLD = 0.35
+# Aviation idle gate: mean wrist displacement across recent frames.
+AVIATION_IDLE_MOTION_THRESHOLD = 0.018
+AVIATION_IDLE_MIN_FRAMES = 4
+# Seatbelt must show wrists closing toward each other.
+SEATBELT_MIN_CLOSING_DELTA = 0.04
+# Hold last aviation gesture briefly to fight MediaPipe flicker.
+AVIATION_HOLD_FRAMES = 4
+
+
+# Finger extension: tip must be substantially farther from the wrist than the MCP.
+FINGER_EXTENDED_MCP_RATIO = 1.28
+# Goodbye is a wag: left-right-left (or right-left-right), not a held palm.
+WAVE_MIN_SAMPLES = 5
+WAVE_MIN_AMPLITUDE = 0.085
+WAVE_REVERSAL_DELTA = 0.02
+WAVE_MIN_REVERSALS = 2
+# Mean wrist travel between frames — Hello must stay still; overlay uses this too.
+HAND_MOTION_ACTIVE_THRESHOLD = 0.014
+
+HAND_TIP_KEYS = (
+    "thumb_tip",
+    "index_tip",
+    "middle_tip",
+    "ring_tip",
+    "pinky_tip",
+)
+HAND_MCP_KEYS = (
+    "thumb_mcp",
+    "index_mcp",
+    "middle_mcp",
+    "ring_mcp",
+    "pinky_mcp",
+)
+HAND_PIP_KEYS = (
+    "thumb_ip",  # thumb has IP instead of PIP
+    "index_pip",
+    "middle_pip",
+    "ring_pip",
+    "pinky_pip",
+)
+
+
+def _euclidean(a: Any, b: Any) -> float:
+    return float(np.linalg.norm(np.asarray(a, dtype=float) - np.asarray(b, dtype=float)))
+
+
+def _point(landmarks: dict[str, Any], key: str) -> dict[str, float] | None:
+    value = landmarks.get(key)
+    if not value or not isinstance(value, dict):
+        return None
+    if "x" not in value or "y" not in value:
+        return None
+    return value
+
+
+def _vec3(point: dict[str, float]) -> np.ndarray:
+    return np.array(
+        [float(point["x"]), float(point["y"]), float(point.get("z", 0.0))],
+        dtype=float,
+    )
+
+
+def _dist2(a: dict[str, float], b: dict[str, float]) -> float:
+    return float(
+        np.hypot(float(a["x"]) - float(b["x"]), float(a["y"]) - float(b["y"]))
+    )
+
+
+def joint_angle_deg(
+    a: dict[str, float],
+    b: dict[str, float],
+    c: dict[str, float],
+) -> float:
+    """Angle at point b formed by points a–b–c, in degrees."""
+    ba = _vec3(a) - _vec3(b)
+    bc = _vec3(c) - _vec3(b)
+    denom = (np.linalg.norm(ba) * np.linalg.norm(bc)) + 1e-8
+    cos_angle = float(np.clip(np.dot(ba, bc) / denom, -1.0, 1.0))
+    return float(np.degrees(np.arccos(cos_angle)))
+
+
+def wrist_visibility(landmarks: dict[str, Any]) -> tuple[float, float]:
+    left = _point(landmarks, "leftWrist")
+    right = _point(landmarks, "rightWrist")
+    left_vis = float(left.get("visibility", 0.0)) if left else 0.0
+    right_vis = float(right.get("visibility", 0.0)) if right else 0.0
+    return left_vis, right_vis
+
+
+def has_low_wrist_visibility(landmarks: dict[str, Any]) -> bool:
+    """True only when wrists are missing or both have very low visibility.
+
+    Raised arms often report visibility < 0.6 even when x/y are valid — do not
+    hard-block scoring solely on Pose visibility.
+    """
+    left = _point(landmarks, "leftWrist")
+    right = _point(landmarks, "rightWrist")
+    if not left or not right:
+        return True
+    if "x" not in left or "y" not in left or "x" not in right or "y" not in right:
+        return True
+    left_vis, right_vis = wrist_visibility(landmarks)
+    # Block only if BOTH wrists are nearly invisible.
+    return (
+        left_vis < WRIST_VISIBILITY_THRESHOLD
+        and right_vis < WRIST_VISIBILITY_THRESHOLD
+    )
+
+
+def is_hand_landmarks(landmarks: dict[str, Any]) -> bool:
+    """True when the payload looks like MediaPipe hand landmarks (not body pose)."""
+    return _point(landmarks, "wrist") is not None and _point(landmarks, "index_tip") is not None
+
+
+def assess_hand_framing(landmarks: dict[str, Any]) -> dict[str, Any]:
+    """Decide if a hand is fully in-frame using x/y bounds — not Pose-style visibility.
+
+    MediaPipe HandLandmarker landmarks usually lack a meaningful `visibility`
+    field (often missing or always 0). Instead we require all 21 points to have
+    coordinates inside the normalized frame and a reasonable bounding-box size.
+    """
+    if not is_hand_landmarks(landmarks):
+        return {
+            "ok": False,
+            "reason": "missing_hand_landmarks",
+            "points_in_frame": 0,
+            "points_total": len(HAND_LANDMARK_KEYS),
+            "bbox_area": 0.0,
+            "sample_visibility": None,
+        }
+
+    xs: list[float] = []
+    ys: list[float] = []
+    in_frame = 0
+    sample_visibility = None
+
+    for key in HAND_LANDMARK_KEYS:
+        point = _point(landmarks, key)
+        if not point:
+            continue
+        x = float(point["x"])
+        y = float(point["y"])
+        xs.append(x)
+        ys.append(y)
+        if sample_visibility is None and "visibility" in point:
+            sample_visibility = point.get("visibility")
+        if (
+            HAND_EDGE_MARGIN <= x <= (1.0 - HAND_EDGE_MARGIN)
+            and HAND_EDGE_MARGIN <= y <= (1.0 - HAND_EDGE_MARGIN)
+        ):
+            in_frame += 1
+
+    if len(xs) < len(HAND_LANDMARK_KEYS):
+        return {
+            "ok": False,
+            "reason": "incomplete_landmarks",
+            "points_in_frame": in_frame,
+            "points_total": len(HAND_LANDMARK_KEYS),
+            "points_present": len(xs),
+            "bbox_area": 0.0,
+            "sample_visibility": sample_visibility,
+        }
+
+    min_x, max_x = min(xs), max(xs)
+    min_y, max_y = min(ys), max(ys)
+    bbox_area = max(0.0, max_x - min_x) * max(0.0, max_y - min_y)
+    all_in = in_frame >= len(HAND_LANDMARK_KEYS)
+    size_ok = bbox_area >= HAND_MIN_BBOX_AREA
+    ok = all_in and size_ok
+
+    reason = "ok"
+    if not all_in:
+        reason = "landmarks_near_edge"
+    elif not size_ok:
+        reason = "bbox_too_small"
+
+    return {
+        "ok": ok,
+        "reason": reason,
+        "points_in_frame": in_frame,
+        "points_total": len(HAND_LANDMARK_KEYS),
+        "points_present": len(xs),
+        "bbox_area": round(bbox_area, 5),
+        "bbox": {
+            "min_x": round(min_x, 4),
+            "max_x": round(max_x, 4),
+            "min_y": round(min_y, 4),
+            "max_y": round(max_y, 4),
+        },
+        "sample_visibility": sample_visibility,
+    }
+
+
+def has_low_hand_visibility(landmarks: dict[str, Any]) -> bool:
+    """Backward-compatible name — now uses framing, not Pose visibility."""
+    return not bool(assess_hand_framing(landmarks).get("ok"))
+
+
+def hand_bbox_area(landmarks: dict[str, Any]) -> float:
+    """Normalized bounding-box area of a hand payload (0 if incomplete)."""
+    framing = assess_hand_framing(landmarks)
+    return float(framing.get("bbox_area") or 0.0)
+
+
+def select_primary_hand(
+    hands: list[dict[str, Any]],
+) -> tuple[dict[str, Any] | None, dict[str, Any]]:
+    """Choose which hand to score when MediaPipe returns left and right.
+
+    Preference among in-frame hands: highest still-sign confidence, then
+    larger bbox. Out-of-frame hands are ignored unless none are framed.
+    """
+    candidates: list[dict[str, Any]] = [
+        hand for hand in hands if isinstance(hand, dict) and is_hand_landmarks(hand)
+    ]
+    if not candidates:
+        return None, {"hand_count": 0, "reason": "no_hand_landmarks"}
+
+    framed: list[tuple[dict[str, Any], dict[str, Any], float, float]] = []
+    for hand in candidates:
+        framing = assess_hand_framing(hand)
+        area = float(framing.get("bbox_area") or 0.0)
+        if framing.get("ok"):
+            _gesture, score, _scores, _detail = best_sign_pose(hand)
+            framed.append((hand, framing, float(score), area))
+
+    pool = framed
+    if not pool:
+        # Fall back to largest visible hand even if framing failed.
+        pool = []
+        for hand in candidates:
+            framing = assess_hand_framing(hand)
+            area = float(framing.get("bbox_area") or 0.0)
+            pool.append((hand, framing, 0.0, area))
+
+    chosen_hand, chosen_framing, chosen_score, chosen_area = max(
+        pool, key=lambda row: (row[2], row[3])
+    )
+    handedness = chosen_hand.get("handedness")
+    return chosen_hand, {
+        "hand_count": len(candidates),
+        "selected_handedness": handedness if isinstance(handedness, str) else None,
+        "selected_score": round(chosen_score, 4),
+        "selected_bbox_area": round(chosen_area, 4),
+        "framing_ok": bool(chosen_framing.get("ok")),
+        "reason": "best_score" if framed else "largest_fallback",
+    }
+
+def _finger_extended(landmarks: dict[str, Any], tip_key: str, pip_key: str, mcp_key: str) -> bool:
+    """True when a finger is clearly outstretched from the palm."""
+    return _finger_extension_ratio(landmarks, tip_key, mcp_key) > FINGER_EXTENDED_MCP_RATIO
+
+
+def _finger_extension_ratio(
+    landmarks: dict[str, Any],
+    tip_key: str,
+    mcp_key: str,
+) -> float:
+    """Tip distance from wrist divided by MCP distance from wrist."""
+    wrist = _point(landmarks, "wrist")
+    tip = _point(landmarks, tip_key)
+    mcp = _point(landmarks, mcp_key)
+    if not wrist or not tip or not mcp:
+        return 0.0
+    base = _dist2(wrist, mcp)
+    if base < 1e-6:
+        return 0.0
+    return _dist2(wrist, tip) / base
+
+
+def _thumb_extended_up(landmarks: dict[str, Any]) -> bool:
+    """Thumb tip clearly above the MCP (image y smaller) and away from the palm."""
+    wrist = _point(landmarks, "wrist")
+    tip = _point(landmarks, "thumb_tip")
+    mcp = _point(landmarks, "thumb_mcp")
+    if not wrist or not tip or not mcp:
+        return False
+    extended = _dist2(wrist, tip) > _dist2(wrist, mcp) * 1.15
+    pointing_up = tip["y"] < mcp["y"] - 0.02
+    return extended and pointing_up
+
+
+def _thumb_extended_down(landmarks: dict[str, Any]) -> bool:
+    """Thumb tip clearly below the MCP (image y larger) and away from the palm."""
+    wrist = _point(landmarks, "wrist")
+    tip = _point(landmarks, "thumb_tip")
+    mcp = _point(landmarks, "thumb_mcp")
+    if not wrist or not tip or not mcp:
+        return False
+    extended = _dist2(wrist, tip) > _dist2(wrist, mcp) * 1.15
+    pointing_down = tip["y"] > mcp["y"] + 0.02
+    return extended and pointing_down
+
+
+def _mean_finger_extension(landmarks: dict[str, Any]) -> float:
+    ratios = [
+        _finger_extension_ratio(landmarks, "index_tip", "index_mcp"),
+        _finger_extension_ratio(landmarks, "middle_tip", "middle_mcp"),
+        _finger_extension_ratio(landmarks, "ring_tip", "ring_mcp"),
+        _finger_extension_ratio(landmarks, "pinky_tip", "pinky_mcp"),
+    ]
+    return float(sum(ratios) / 4.0)
+
+
+def _thumb_tip_above_fingers(landmarks: dict[str, Any], margin: float = 0.04) -> bool:
+    """Thumb tip sits clearly above the other finger tips (Yes cue)."""
+    tip = _point(landmarks, "thumb_tip")
+    if not tip:
+        return False
+    others_y: list[float] = []
+    for key in ("index_tip", "middle_tip", "ring_tip", "pinky_tip"):
+        other = _point(landmarks, key)
+        if other:
+            others_y.append(float(other["y"]))
+    if len(others_y) < 3:
+        return False
+    return float(tip["y"]) < min(others_y) - margin
+
+
+def _fingers_clearly_curled(landmarks: dict[str, Any]) -> bool:
+    """Four fingers tucked — used for Yes/No/Clear separation."""
+    return _mean_finger_extension(landmarks) <= 1.18
+
+
+def looks_like_thumbs_up(landmarks: dict[str, Any]) -> bool:
+    """Thumb sticks clearly above a closed fist — not a tucked thumb on a fist."""
+    if not is_hand_landmarks(landmarks):
+        return False
+    flags = finger_extension_flags(landmarks)
+    # Pinky-up (You) must never count as Yes.
+    if flags and flags["pinky"]:
+        return False
+    tip = _point(landmarks, "thumb_tip")
+    mcp = _point(landmarks, "thumb_mcp")
+    if not tip or not mcp:
+        return False
+    # Strong vertical cue: tip well above MCP.
+    if tip["y"] >= mcp["y"] - 0.055:
+        return False
+    thumb_r = _finger_extension_ratio(landmarks, "thumb_tip", "thumb_mcp")
+    others = _mean_finger_extension(landmarks)
+    if thumb_r < 1.25:
+        return False
+    if others > 1.18:
+        return False
+    if not _thumb_tip_above_fingers(landmarks, margin=0.03):
+        return False
+    return thumb_r >= others + 0.18
+
+
+def _thumb_stuck_out_for_shaka(landmarks: dict[str, Any]) -> bool:
+    """True shaka thumb: tip far from the index knuckle, not resting on the fist.
+
+    MediaPipe often marks a tucked thumb as weakly `thumb_up`. Please must
+    require a clearly abducted thumb so pinky-only You is not stolen.
+    """
+    tip = _point(landmarks, "thumb_tip")
+    mcp = _point(landmarks, "thumb_mcp")
+    index_mcp = _point(landmarks, "index_mcp")
+    wrist = _point(landmarks, "wrist")
+    if not tip or not mcp or not index_mcp or not wrist:
+        return False
+    hand_scale = _dist2(wrist, index_mcp) + 1e-6
+    # Resting thumb sits near the index knuckle; shaka sticks out away from it.
+    if _dist2(tip, index_mcp) / hand_scale < 0.9:
+        return False
+    thumb_r = _finger_extension_ratio(landmarks, "thumb_tip", "thumb_mcp")
+    if thumb_r < 1.3:
+        return False
+    # Tip clearly displaced from MCP (up or sideways).
+    if abs(float(tip["y"]) - float(mcp["y"])) < 0.035 and abs(
+        float(tip["x"]) - float(mcp["x"])
+    ) < 0.05:
+        return False
+    return True
+
+
+def looks_like_please(landmarks: dict[str, Any]) -> bool:
+    """Shaka: thumb and pinky clearly out; index/middle/ring curled."""
+    if not is_hand_landmarks(landmarks):
+        return False
+    flags = finger_extension_flags(landmarks)
+    if not flags:
+        return False
+    if not flags["pinky"]:
+        return False
+    if flags["index"] or flags["middle"] or flags["ring"]:
+        return False
+    if not _thumb_stuck_out_for_shaka(landmarks):
+        return False
+    pinky_r = _finger_extension_ratio(landmarks, "pinky_tip", "pinky_mcp")
+    return pinky_r >= 1.22
+
+
+def looks_like_you(landmarks: dict[str, Any]) -> bool:
+    """Only the pinky is clearly up — You (not Yes / Please / ILY)."""
+    if not is_hand_landmarks(landmarks):
+        return False
+    flags = finger_extension_flags(landmarks)
+    if not flags:
+        return False
+    if not flags["pinky"]:
+        return False
+    if flags["index"] or flags["middle"] or flags["ring"]:
+        return False
+    # Real shaka (Please) — not a resting thumb that still flags thumb_up.
+    if looks_like_please(landmarks):
+        return False
+    pinky_r = _finger_extension_ratio(landmarks, "pinky_tip", "pinky_mcp")
+    if pinky_r < 1.22:
+        return False
+    # Pinky tip should sit clearly above the curled finger tips.
+    pinky_tip = _point(landmarks, "pinky_tip")
+    if not pinky_tip:
+        return False
+    curled_y: list[float] = []
+    for key in ("index_tip", "middle_tip", "ring_tip"):
+        other = _point(landmarks, key)
+        if other:
+            curled_y.append(float(other["y"]))
+    if curled_y and float(pinky_tip["y"]) > min(curled_y) - 0.01:
+        return False
+    return True
+
+
+def looks_like_index_only(landmarks: dict[str, Any]) -> bool:
+    """Index extended; middle/ring/pinky curled; thumb not a Yes."""
+    if not is_hand_landmarks(landmarks):
+        return False
+    flags = finger_extension_flags(landmarks)
+    if not flags:
+        return False
+    if not flags["index"]:
+        return False
+    if flags["middle"] or flags["ring"] or flags["pinky"]:
+        return False
+    if looks_like_thumbs_up(landmarks):
+        return False
+    index_r = _finger_extension_ratio(landmarks, "index_tip", "index_mcp")
+    return index_r >= 1.18
+
+
+def looks_like_direction(landmarks: dict[str, Any]) -> bool:
+    """Single index pointing sideways (Help is forward-ish toward camera)."""
+    if not looks_like_index_only(landmarks):
+        return False
+    wrist = _point(landmarks, "wrist")
+    index_tip = _point(landmarks, "index_tip")
+    index_mcp = _point(landmarks, "index_mcp")
+    if not wrist or not index_tip or not index_mcp:
+        return False
+    dx = abs(float(index_tip["x"]) - float(wrist["x"]))
+    dy = abs(float(index_tip["y"]) - float(wrist["y"]))
+    # Sideways: more horizontal travel than vertical.
+    if dx < 0.08:
+        return False
+    return dx >= dy * 1.15
+
+
+def looks_like_help_point(landmarks: dict[str, Any]) -> bool:
+    """Index-only pointing toward the camera (spoken meaning: I)."""
+    if not looks_like_index_only(landmarks):
+        return False
+    return not looks_like_direction(landmarks)
+
+
+def looks_like_peace_sign(landmarks: dict[str, Any]) -> bool:
+    """Index + middle up; ring and pinky curled (Thank you / two-hand Understood)."""
+    flags = finger_extension_flags(landmarks)
+    if not flags:
+        return False
+    if not (flags["index"] and flags["middle"]):
+        return False
+    if flags["ring"] or flags["pinky"]:
+        return False
+    if flags["thumb_up"]:
+        return False
+    return True
+
+
+def looks_like_thumb_sideways(landmarks: dict[str, Any]) -> bool:
+    """Thumb stuck out sideways from a closed fist (not Yes / No / Please).
+
+    One hand → Undo. Both hands → Clear.
+    """
+    if not is_hand_landmarks(landmarks):
+        return False
+    if looks_like_thumbs_up(landmarks):
+        return False
+    if looks_like_please(landmarks) or looks_like_you(landmarks):
+        return False
+    flags = finger_extension_flags(landmarks)
+    if not flags:
+        return False
+    # Reject open / four-finger hands.
+    if flags["index"] or flags["middle"] or flags["ring"] or flags["pinky"]:
+        return False
+    if not _fingers_clearly_curled(landmarks):
+        return False
+    tip = _point(landmarks, "thumb_tip")
+    mcp = _point(landmarks, "thumb_mcp")
+    if not tip or not mcp:
+        return False
+    thumb_r = _finger_extension_ratio(landmarks, "thumb_tip", "thumb_mcp")
+    if thumb_r < 1.22:
+        return False
+    dx = abs(float(tip["x"]) - float(mcp["x"]))
+    dy = abs(float(tip["y"]) - float(mcp["y"]))
+    # Sideways: more horizontal than vertical travel from the knuckle.
+    if dx < 0.035:
+        return False
+    if dx < dy * 1.1:
+        return False
+    # Reject strong Yes (tip high) and strong No (tip low).
+    if float(tip["y"]) < float(mcp["y"]) - 0.055:
+        return False
+    if float(tip["y"]) > float(mcp["y"]) + 0.07:
+        return False
+    return True
+
+
+def _dual_closed_fist(landmarks: dict[str, Any]) -> bool:
+    """True closed fist for two-hand Sick/Doctor — not pointing / Yes / pinky."""
+    if not looks_like_fist(landmarks):
+        return False
+    if looks_like_index_only(landmarks) or looks_like_help_point(landmarks):
+        return False
+    if looks_like_thumbs_up(landmarks) or looks_like_you(landmarks):
+        return False
+    if looks_like_peace_sign(landmarks):
+        return False
+    flags = finger_extension_flags(landmarks)
+    if flags and (flags["index"] or flags["middle"] or flags["pinky"]):
+        return False
+    return True
+
+
+def detect_two_hand_aac_sign(
+    hands: list[Any] | None,
+) -> SignClass | None:
+    """Two-hand AAC holds (both hands visible).
+
+    Priority is most-specific shapes first so Help / Happy / Sick do not
+    collapse into Today or Doctor.
+    """
+    if not isinstance(hands, list) or len(hands) < 2:
+        return None
+    candidates = [
+        hand
+        for hand in hands
+        if isinstance(hand, dict) and is_hand_landmarks(hand)
+    ]
+    if len(candidates) < 2:
+        return None
+    framed = [
+        hand
+        for hand in candidates
+        if assess_hand_framing(hand).get("ok")
+    ]
+    pool = framed if len(framed) >= 2 else candidates
+    if len(pool) < 2:
+        return None
+    ranked = sorted(
+        pool,
+        key=lambda hand: float(assess_hand_framing(hand).get("bbox_area") or 0.0),
+        reverse=True,
+    )
+    left, right = ranked[0], ranked[1]
+
+    # Help — both indexes at camera.
+    if looks_like_index_only(left) and looks_like_index_only(right):
+        return "i"
+    # Clear — both thumbs sideways (single sideways thumb is Undo).
+    if looks_like_thumb_sideways(left) and looks_like_thumb_sideways(right):
+        return "fist"
+    # Happy — both thumbs up (single thumbs-up stays Yes).
+    if looks_like_thumbs_up(left) and looks_like_thumbs_up(right):
+        return "happy"
+    # Understood — both peace / V (before fist checks).
+    if looks_like_peace_sign(left) and looks_like_peace_sign(right):
+        return "understood"
+    # Tomorrow — both pinky-up.
+    if looks_like_you(left) and looks_like_you(right):
+        return "tomorrow"
+    # Sick — both closed fists (Clear is both sideways thumbs, not fists).
+    if _dual_closed_fist(left) and _dual_closed_fist(right):
+        return "sick"
+    # Today — both open palms (single palm stays Hello).
+    if looks_like_open_palm(left) and looks_like_open_palm(right):
+        return "today"
+    # Doctor — one closed fist + one open palm (either side).
+    if (_dual_closed_fist(left) and looks_like_open_palm(right)) or (
+        looks_like_open_palm(left) and _dual_closed_fist(right)
+    ):
+        return "doctor"
+    return None
+
+
+def _tip_cluster_stats(
+    landmarks: dict[str, Any],
+) -> tuple[float, float, float] | None:
+    """Return (spread_over_scale, cluster_y, wrist_y) for all five fingertips."""
+    wrist = _point(landmarks, "wrist")
+    middle_mcp = _point(landmarks, "middle_mcp")
+    tips = [
+        _point(landmarks, key)
+        for key in ("thumb_tip", "index_tip", "middle_tip", "ring_tip", "pinky_tip")
+    ]
+    if not wrist or any(tip is None for tip in tips):
+        return None
+    tip_list = [tip for tip in tips if tip is not None]
+    scale = _dist2(wrist, middle_mcp or tip_list[2]) + 1e-6
+    cx = sum(float(t["x"]) for t in tip_list) / len(tip_list)
+    cy = sum(float(t["y"]) for t in tip_list) / len(tip_list)
+    spread = (
+        sum(
+            ((float(t["x"]) - cx) ** 2 + (float(t["y"]) - cy) ** 2) ** 0.5
+            for t in tip_list
+        )
+        / len(tip_list)
+        / scale
+    )
+    return spread, cy, float(wrist["y"])
+
+
+def looks_like_water(landmarks: dict[str, Any]) -> bool:
+    """Thumb+index pinch raised toward the face (chin/mouth).
+
+    Pinch shape is checked first. A raised pinch often also looks like
+    index-only / I, so we do not reject on help_point when the pinch is tight.
+    Uses tips above the wrist — not absolute screen y — so mid-webcam works.
+    """
+    if not is_hand_landmarks(landmarks):
+        return False
+    if looks_like_thumbs_up(landmarks):
+        return False
+    flags = finger_extension_flags(landmarks)
+    if not flags:
+        return False
+    # Other fingers mostly curled (allow one noisy finger).
+    curled = sum(
+        1 for name in ("middle", "ring", "pinky") if not flags[name]
+    )
+    if curled < 2:
+        return False
+    thumb_tip = _point(landmarks, "thumb_tip")
+    index_tip = _point(landmarks, "index_tip")
+    index_mcp = _point(landmarks, "index_mcp")
+    wrist = _point(landmarks, "wrist")
+    middle_mcp = _point(landmarks, "middle_mcp")
+    if not thumb_tip or not index_tip or not wrist or not index_mcp:
+        return False
+    scale = _dist2(wrist, middle_mcp or index_mcp) + 1e-6
+    pinch = _dist2(thumb_tip, index_tip) / scale
+    # Must be a real pinch (thumb touching / near index).
+    if pinch > 0.55:
+        return False
+    tip_y = (float(thumb_tip["y"]) + float(index_tip["y"])) / 2.0
+    wrist_y = float(wrist["y"])
+    mcp_y = float(index_mcp["y"])
+    # Raised toward face: pinch clearly above wrist AND above the MCP row
+    # so a low Clear fist (tips collapsed near knuckles) is not Water.
+    if tip_y > wrist_y - 0.08:
+        return False
+    if tip_y > mcp_y - 0.02:
+        return False
+    # Soft floor so a hand resting low is not Water.
+    if tip_y > 0.78:
+        return False
+    # Curled fingers should sit below the pinch (sip), not at the same height.
+    curled_ys = []
+    for key in ("middle_tip", "ring_tip", "pinky_tip"):
+        tip = _point(landmarks, key)
+        if tip:
+            curled_ys.append(float(tip["y"]))
+    if curled_ys and tip_y > (sum(curled_ys) / len(curled_ys)) - 0.02:
+        return False
+    # Loose sideways index without a pinch is Direction — leave those alone.
+    if pinch > 0.35 and looks_like_direction(landmarks):
+        return False
+    return True
+
+
+def looks_like_food(landmarks: dict[str, Any]) -> bool:
+    """Bunched fingertips raised toward the mouth (soft O / eat).
+
+    Cluster tightness beats open-palm finger flags: a hand lifted to the mouth
+    often still reads as 'all fingers extended' toward the camera.
+    """
+    if not is_hand_landmarks(landmarks):
+        return False
+    if looks_like_thumbs_up(landmarks):
+        return False
+    if looks_like_water(landmarks):
+        return False
+    stats = _tip_cluster_stats(landmarks)
+    if not stats:
+        return False
+    spread, cy, wrist_y = stats
+    # Bunched tips — open Hello / Undo have much larger tip spread.
+    if spread > 0.42:
+        return False
+    # Tips lifted toward face (above wrist). Mid-frame chin is fine.
+    if cy > wrist_y - 0.07:
+        return False
+    if cy > 0.78:
+        return False
+    # Soft bunch sits at/above the MCP row. Tips curled below knuckles = Clear.
+    mcp_ys = []
+    for key in ("index_mcp", "middle_mcp", "ring_mcp"):
+        mcp = _point(landmarks, key)
+        if mcp:
+            mcp_ys.append(float(mcp["y"]))
+    if mcp_ys and cy > (sum(mcp_ys) / len(mcp_ys)) + 0.015:
+        return False
+    # Single-finger I / Help is not a bunch.
+    if looks_like_help_point(landmarks) or looks_like_direction(landmarks):
+        return False
+    return True
+
+
+def looks_like_fist(landmarks: dict[str, Any]) -> bool:
+    """Closed hand: four fingers curled and the thumb not raised as Yes."""
+    if not is_hand_landmarks(landmarks):
+        return False
+    if looks_like_thumbs_up(landmarks):
+        return False
+    if _thumb_extended_down(landmarks):
+        return False
+    if not _fingers_clearly_curled(landmarks):
+        return False
+    tip = _point(landmarks, "thumb_tip")
+    mcp = _point(landmarks, "thumb_mcp")
+    # Reject Yes-ish: thumb tip rising above MCP.
+    if tip and mcp and tip["y"] < mcp["y"] - 0.035:
+        return False
+    return True
+
+
+def looks_like_open_palm(landmarks: dict[str, Any]) -> bool:
+    """Open palm Hello — four fingers out and thumb extended (not the 4 / Undo pose)."""
+    flags = finger_extension_flags(landmarks)
+    if not flags:
+        return False
+    if not (flags["index"] and flags["middle"] and flags["ring"] and flags["pinky"]):
+        return False
+    if not (flags["thumb"] or flags["thumb_up"]):
+        return False
+    return _mean_finger_extension(landmarks) >= 1.32
+
+
+def looks_like_four(landmarks: dict[str, Any]) -> bool:
+    """Four fingers up, thumb tucked — Undo last word (not Hello)."""
+    flags = finger_extension_flags(landmarks)
+    if not flags:
+        return False
+    if not (flags["index"] and flags["middle"] and flags["ring"] and flags["pinky"]):
+        return False
+    if flags["thumb_up"] or flags["thumb_down"] or flags["thumb"]:
+        return False
+    return _mean_finger_extension(landmarks) >= 1.28
+
+
+def finger_extension_flags(landmarks: dict[str, Any]) -> dict[str, bool] | None:
+    if not is_hand_landmarks(landmarks):
+        return None
+    return {
+        "thumb_up": _thumb_extended_up(landmarks),
+        "thumb_down": _thumb_extended_down(landmarks),
+        "thumb": _finger_extended(landmarks, "thumb_tip", "thumb_ip", "thumb_mcp"),
+        "index": _finger_extended(landmarks, "index_tip", "index_pip", "index_mcp"),
+        "middle": _finger_extended(landmarks, "middle_tip", "middle_pip", "middle_mcp"),
+        "ring": _finger_extended(landmarks, "ring_tip", "ring_pip", "ring_mcp"),
+        "pinky": _finger_extended(landmarks, "pinky_tip", "pinky_pip", "pinky_mcp"),
+    }
+
+
+def hand_pose_features(landmarks: dict[str, Any]) -> list[float] | None:
+    """Normalized tip positions + extension ratios relative to the wrist/palm."""
+    wrist = _point(landmarks, "wrist")
+    middle_mcp = _point(landmarks, "middle_mcp")
+    if not wrist or not middle_mcp:
+        return None
+
+    scale = _dist2(wrist, middle_mcp) + 1e-6
+    features: list[float] = []
+
+    for tip_key in HAND_TIP_KEYS:
+        tip = _point(landmarks, tip_key)
+        if not tip:
+            return None
+        features.append((float(tip["x"]) - float(wrist["x"])) / scale)
+        features.append((float(tip["y"]) - float(wrist["y"])) / scale)
+
+    for tip_key, mcp_key in zip(HAND_TIP_KEYS, HAND_MCP_KEYS, strict=True):
+        tip = _point(landmarks, tip_key)
+        mcp = _point(landmarks, mcp_key)
+        if not tip or not mcp:
+            return None
+        features.append(_dist2(wrist, tip) / (_dist2(wrist, mcp) + 1e-6))
+
+    return features
+
+
+def hand_wave_features(landmarks: dict[str, Any]) -> list[float] | None:
+    """Per-frame features for wave DTW: wrist position + index tip relative to wrist."""
+    wrist = _point(landmarks, "wrist")
+    index_tip = _point(landmarks, "index_tip")
+    if not wrist or not index_tip:
+        return None
+    return [
+        float(wrist["x"]),
+        float(wrist["y"]),
+        float(index_tip["x"]) - float(wrist["x"]),
+        float(index_tip["y"]) - float(wrist["y"]),
+    ]
+
+
+def _heuristic_sign_score(landmarks: dict[str, Any], gesture: str) -> float:
+    """How cleanly the finger pattern matches a known sign (0–1)."""
+    flags = finger_extension_flags(landmarks)
+    if not flags:
+        return 0.0
+
+    index = flags["index"]
+    middle = flags["middle"]
+    ring = flags["ring"]
+    pinky = flags["pinky"]
+    thumb_up = flags["thumb_up"]
+    thumb_down = flags["thumb_down"]
+    others = (index, middle, ring, pinky)
+
+    if gesture == "thumbs_up":
+        if looks_like_you(landmarks):
+            return 0.08
+        if looks_like_thumbs_up(landmarks):
+            return 0.97
+        if looks_like_fist(landmarks):
+            return 0.12
+        curled = sum(1 for f in others if not f)
+        return min(0.42, (0.22 if thumb_up else 0.0) + 0.05 * curled)
+    if gesture == "thumbs_down":
+        curled = sum(1 for f in others if not f)
+        return min(1.0, (0.55 if thumb_down else 0.0) + 0.1125 * curled)
+    if gesture == "open_palm":
+        if looks_like_open_palm(landmarks):
+            return 0.94
+        if looks_like_four(landmarks):
+            return 0.12
+        extended = sum(1 for f in others if f)
+        return min(1.0, 0.22 * extended + (0.08 if flags["thumb"] else 0.0))
+    if gesture == "four":
+        # Undo = one thumb sideways (not four fingers).
+        if looks_like_thumb_sideways(landmarks):
+            return 0.96
+        if looks_like_open_palm(landmarks) or looks_like_four(landmarks):
+            return 0.08
+        return 0.05
+    if gesture == "fist":
+        # Clear is both thumbs sideways (dual-hand path). Single fist is not Clear.
+        if looks_like_thumb_sideways(landmarks):
+            return 0.25
+        if looks_like_fist(landmarks):
+            return 0.12
+        return 0.05
+    if gesture == "pointing":
+        if looks_like_direction(landmarks):
+            return 0.12
+        if looks_like_help_point(landmarks):
+            return 0.95
+        score = 0.0
+        if index:
+            score += 0.45
+        score += 0.183 * sum(1 for f in (middle, ring, pinky) if not f)
+        return min(1.0, score)
+    if gesture == "direction":
+        if looks_like_direction(landmarks):
+            return 0.96
+        if looks_like_help_point(landmarks):
+            return 0.1
+        score = 0.0
+        if index and not middle and not ring and not pinky:
+            score += 0.4
+        wrist = _point(landmarks, "wrist")
+        tip = _point(landmarks, "index_tip")
+        if wrist and tip:
+            dx = abs(float(tip["x"]) - float(wrist["x"]))
+            dy = abs(float(tip["y"]) - float(wrist["y"]))
+            if dx > dy:
+                score += 0.35
+        return min(1.0, score)
+    if gesture == "water":
+        if looks_like_water(landmarks):
+            return 0.95
+        return 0.08
+    if gesture == "food":
+        if looks_like_food(landmarks):
+            return 0.94
+        return 0.08
+    if gesture == "i":
+        # Single-hand score stays low; dual-hand path sets Help.
+        if looks_like_index_only(landmarks):
+            return 0.25
+        return 0.05
+    if gesture == "peace_sign":
+        score = 0.0
+        if index:
+            score += 0.3
+        if middle:
+            score += 0.3
+        score += 0.2 * sum(1 for f in (ring, pinky) if not f)
+        return min(1.0, score)
+    if gesture == "please":
+        if looks_like_you(landmarks):
+            return 0.08
+        if looks_like_please(landmarks):
+            return 0.97
+        score = 0.0
+        if _thumb_stuck_out_for_shaka(landmarks):
+            score += 0.4
+        elif thumb_up:
+            score += 0.12
+        if pinky:
+            score += 0.35
+        score += 0.083 * sum(1 for f in (index, middle, ring) if not f)
+        return min(1.0, score)
+    if gesture == "i_love_you":
+        score = 0.0
+        if thumb_up:
+            score += 0.25
+        if index:
+            score += 0.25
+        if pinky:
+            score += 0.25
+        score += 0.125 * sum(1 for f in (middle, ring) if not f)
+        return min(1.0, score)
+    if gesture == "want":
+        score = 0.0
+        if index:
+            score += 0.25
+        if middle:
+            score += 0.25
+        if ring:
+            score += 0.25
+        if not pinky:
+            score += 0.25
+        return min(1.0, score)
+    if gesture == "you":
+        if looks_like_you(landmarks):
+            return 0.97
+        if looks_like_please(landmarks):
+            return 0.1
+        score = 0.0
+        if pinky:
+            score += 0.55
+        score += 0.15 * sum(1 for f in (index, middle, ring) if not f)
+        return min(1.0, score)
+    if gesture == "okay":
+        score = 0.0
+        if not index:
+            score += 0.3
+        if middle:
+            score += 0.23
+        if ring:
+            score += 0.23
+        if pinky:
+            score += 0.24
+        return min(1.0, score)
+    # Two-hand-only AAC words — single-hand score stays near zero.
+    if gesture in (
+        "understood",
+        "doctor",
+        "sick",
+        "happy",
+        "today",
+        "tomorrow",
+    ):
+        return 0.05
+    return 0.0
+
+
+def _aviation_torso_metrics(
+    landmarks: dict[str, Any],
+) -> dict[str, Any] | None:
+    left_shoulder = _point(landmarks, "leftShoulder")
+    right_shoulder = _point(landmarks, "rightShoulder")
+    left_wrist = _point(landmarks, "leftWrist")
+    right_wrist = _point(landmarks, "rightWrist")
+    left_elbow = _point(landmarks, "leftElbow")
+    right_elbow = _point(landmarks, "rightElbow")
+    left_hip = _point(landmarks, "leftHip")
+    right_hip = _point(landmarks, "rightHip")
+
+    if not left_shoulder or not right_shoulder or not left_wrist or not right_wrist:
+        return None
+
+    shoulder_width = abs(float(right_shoulder["x"]) - float(left_shoulder["x"])) + 1e-6
+    mid_shoulder_x = (float(left_shoulder["x"]) + float(right_shoulder["x"])) / 2.0
+    mid_shoulder_y = (float(left_shoulder["y"]) + float(right_shoulder["y"])) / 2.0
+
+    return {
+        "left_shoulder": left_shoulder,
+        "right_shoulder": right_shoulder,
+        "left_wrist": left_wrist,
+        "right_wrist": right_wrist,
+        "left_elbow": left_elbow,
+        "right_elbow": right_elbow,
+        "left_hip": left_hip,
+        "right_hip": right_hip,
+        "shoulder_width": shoulder_width,
+        "mid_shoulder_x": mid_shoulder_x,
+        "mid_shoulder_y": mid_shoulder_y,
+    }
+
+
+def _side_exit_signals(
+    *,
+    side: str,
+    shoulder: dict[str, float],
+    elbow: dict[str, float] | None,
+    wrist: dict[str, float],
+    mid_shoulder_x: float,
+    shoulder_width: float,
+) -> dict[str, float]:
+    """Per-arm height / spread / extension scores in [0, 1]."""
+    # Height: 1 when wrist at/above shoulder, soft falloff below.
+    delta_y = float(wrist["y"]) - float(shoulder["y"])
+    if delta_y <= 0:
+        height = 1.0
+    elif delta_y >= EXIT_HEIGHT_SLACK:
+        height = 0.0
+    else:
+        height = 1.0 - (delta_y / EXIT_HEIGHT_SLACK)
+
+    # Spread: lateral distance from mid-shoulder, normalized by shoulder width.
+    if side == "left":
+        lateral = mid_shoulder_x - float(wrist["x"])
+    else:
+        lateral = float(wrist["x"]) - mid_shoulder_x
+    spread_ratio = max(0.0, lateral) / shoulder_width
+    spread = min(1.0, spread_ratio / EXIT_MIN_SPREAD_RATIO)
+
+    # Extension: horizontal reach (not vertical hang) vs upper-arm length.
+    horizontal_reach = abs(float(wrist["x"]) - float(shoulder["x"]))
+    if elbow:
+        upper = _dist2(shoulder, elbow) + 1e-6
+        extension_ratio = horizontal_reach / upper
+    else:
+        extension_ratio = horizontal_reach / shoulder_width
+    extension = min(1.0, extension_ratio / EXIT_MIN_EXTENSION_RATIO)
+
+    # Height is required for exit pointing — hanging arms must not score high.
+    raw = (0.40 * height) + (0.35 * spread) + (0.25 * extension)
+    score = raw * (0.25 + 0.75 * height)
+
+    return {
+        "height": height,
+        "spread": spread,
+        "extension": extension,
+        "delta_y": delta_y,
+        "spread_ratio": spread_ratio,
+        "extension_ratio": extension_ratio,
+        "score": score,
+    }
+
+
+def exit_pointing_attempt_score(
+    landmarks: dict[str, Any],
+) -> tuple[float, dict[str, Any]]:
+    """Multi-signal confidence that the trainee is attempting exit pointing."""
+    torso = _aviation_torso_metrics(landmarks)
+    if not torso:
+        return 0.0, {"reason": "missing_shoulders_or_wrists"}
+
+    left = _side_exit_signals(
+        side="left",
+        shoulder=torso["left_shoulder"],
+        elbow=torso["left_elbow"],
+        wrist=torso["left_wrist"],
+        mid_shoulder_x=torso["mid_shoulder_x"],
+        shoulder_width=torso["shoulder_width"],
+    )
+    right = _side_exit_signals(
+        side="right",
+        shoulder=torso["right_shoulder"],
+        elbow=torso["right_elbow"],
+        wrist=torso["right_wrist"],
+        mid_shoulder_x=torso["mid_shoulder_x"],
+        shoulder_width=torso["shoulder_width"],
+    )
+    score = (left["score"] + right["score"]) / 2.0
+    debug = {
+        "shoulder_width": round(torso["shoulder_width"], 4),
+        "left": {k: round(v, 4) for k, v in left.items()},
+        "right": {k: round(v, 4) for k, v in right.items()},
+        "exit_score": round(score, 4),
+    }
+    return score, debug
+
+
+def seatbelt_attempt_score(
+    landmarks: dict[str, Any],
+) -> tuple[float, dict[str, Any]]:
+    """Confidence that hands are in the waist seatbelt zone."""
+    torso = _aviation_torso_metrics(landmarks)
+    if not torso or not torso["left_hip"] or not torso["right_hip"]:
+        return 0.0, {"reason": "missing_hips_or_wrists"}
+
+    mid_hip_y = (
+        float(torso["left_hip"]["y"]) + float(torso["right_hip"]["y"])
+    ) / 2.0
+    mid_shoulder_y = torso["mid_shoulder_y"]
+    shoulder_width = torso["shoulder_width"]
+    left_shoulder = torso["left_shoulder"]
+    right_shoulder = torso["right_shoulder"]
+
+    left_w = torso["left_wrist"]
+    right_w = torso["right_wrist"]
+
+    below_shoulders = (
+        float(left_w["y"]) > mid_shoulder_y + 0.03
+        and float(right_w["y"]) > mid_shoulder_y + 0.03
+    )
+    if not below_shoulders:
+        return 0.0, {
+            "reason": "wrists_not_below_shoulders",
+            "left_y": round(float(left_w["y"]), 4),
+            "right_y": round(float(right_w["y"]), 4),
+            "mid_shoulder_y": round(mid_shoulder_y, 4),
+        }
+
+    # Arms hanging at sides (wrists under shoulders) are not a seatbelt attempt.
+    left_hang = abs(float(left_w["x"]) - float(left_shoulder["x"])) / shoulder_width
+    right_hang = abs(float(right_w["x"]) - float(right_shoulder["x"])) / shoulder_width
+    if left_hang < 0.35 and right_hang < 0.35:
+        return 0.0, {
+            "reason": "arms_hanging_at_sides",
+            "left_hang": round(left_hang, 4),
+            "right_hang": round(right_hang, 4),
+        }
+
+    def _waist_score(wrist: dict[str, float]) -> float:
+        dy = float(wrist["y"]) - mid_hip_y
+        if -SEATBELT_MAX_WRIST_ABOVE_HIP <= dy <= SEATBELT_MAX_WRIST_BELOW_HIP:
+            return 1.0
+        # Soft falloff outside the band.
+        if dy < -SEATBELT_MAX_WRIST_ABOVE_HIP:
+            over = -SEATBELT_MAX_WRIST_ABOVE_HIP - dy
+        else:
+            over = dy - SEATBELT_MAX_WRIST_BELOW_HIP
+        return max(0.0, 1.0 - over / 0.12)
+
+    left_waist = _waist_score(left_w)
+    right_waist = _waist_score(right_w)
+    separation = abs(float(right_w["x"]) - float(left_w["x"]))
+    sep_ratio = separation / shoulder_width
+    # Prefer a clear closing path: either fairly wide or already close.
+    path_bias = 1.0
+    if 0.9 < sep_ratio < 1.15:
+        path_bias = 0.55
+
+    score = 0.45 * left_waist + 0.45 * right_waist + 0.10 * path_bias
+    debug = {
+        "left_waist": round(left_waist, 4),
+        "right_waist": round(right_waist, 4),
+        "wrist_separation": round(separation, 4),
+        "left_hang": round(left_hang, 4),
+        "right_hang": round(right_hang, 4),
+        "seatbelt_score": round(score, 4),
+    }
+    return score, debug
+
+
+def classify_aviation_attempt(
+    landmarks: dict[str, Any],
+    *,
+    previous: AviationClass | None = None,
+) -> tuple[AviationClass, dict[str, Any]]:
+    """Classify aviation attempt with multi-signal scores + hold hysteresis."""
+    exit_score, exit_debug = exit_pointing_attempt_score(landmarks)
+    seat_score, seat_debug = seatbelt_attempt_score(landmarks)
+
+    exit_thresh = (
+        EXIT_HOLD_THRESHOLD if previous == "exit_pointing" else EXIT_ATTEMPT_THRESHOLD
+    )
+    seat_thresh = (
+        SEATBELT_HOLD_THRESHOLD
+        if previous == "seatbelt_demo"
+        else SEATBELT_ATTEMPT_THRESHOLD
+    )
+
+    debug = {
+        "exit": exit_debug,
+        "seatbelt": seat_debug,
+        "exit_thresh": exit_thresh,
+        "seatbelt_thresh": seat_thresh,
+        "previous": previous,
+    }
+
+    # Prefer the stronger signal when both fire.
+    if exit_score >= exit_thresh and exit_score >= seat_score:
+        debug["chosen"] = "exit_pointing"
+        return "exit_pointing", debug
+    if seat_score >= seat_thresh:
+        debug["chosen"] = "seatbelt_demo"
+        return "seatbelt_demo", debug
+
+    debug["chosen"] = "none"
+    return "none", debug
+
+
+def classify_aviation_attempt_legacy(landmarks: dict[str, Any]) -> AviationClass:
+    """Backward-compatible wrapper returning only the class label."""
+    label, _debug = classify_aviation_attempt(landmarks)
+    return label
+
+
+def _wrist_x_series(buffer: list[dict[str, Any]]) -> list[float]:
+    xs: list[float] = []
+    for frame in buffer:
+        wrist = _point(frame, "wrist")
+        if wrist:
+            xs.append(float(wrist["x"]))
+    return xs
+
+
+def wave_direction_reversals(xs: list[float]) -> int:
+    """Count left↔right direction changes large enough to be a wag, not jitter."""
+    if len(xs) < 3:
+        return 0
+    reversals = 0
+    last_direction = 0
+    last_x = xs[0]
+    for x in xs[1:]:
+        delta = x - last_x
+        if abs(delta) < WAVE_REVERSAL_DELTA:
+            continue
+        direction = 1 if delta > 0 else -1
+        if last_direction != 0 and direction != last_direction:
+            reversals += 1
+        last_direction = direction
+        last_x = x
+    return reversals
+
+
+def buffer_looks_like_wave(buffer: list[dict[str, Any]]) -> bool:
+    """True only for a repeated side-to-side wag, never a held or arriving palm."""
+    xs = _wrist_x_series(buffer)
+    if len(xs) < WAVE_MIN_SAMPLES:
+        return False
+    amplitude = max(xs) - min(xs)
+    if amplitude < WAVE_MIN_AMPLITUDE:
+        return False
+    return wave_direction_reversals(xs) >= WAVE_MIN_REVERSALS
+
+
+def _buffer_looks_like_wave(buffer: list[dict[str, Any]]) -> bool:
+    return buffer_looks_like_wave(buffer)
+
+
+def hand_motion_energy(buffer: list[dict[str, Any]]) -> float:
+    """Mean wrist displacement between consecutive hand frames."""
+    if len(buffer) < 2:
+        return 0.0
+    deltas: list[float] = []
+    prev = _point(buffer[0], "wrist")
+    for frame in buffer[1:]:
+        wrist = _point(frame, "wrist")
+        if prev and wrist:
+            deltas.append(_dist2(prev, wrist))
+        prev = wrist
+    if not deltas:
+        return 0.0
+    return float(np.mean(deltas))
+
+
+def classify_sign_attempt(
+    landmarks: dict[str, Any],
+    buffer: list[dict[str, Any]] | None = None,
+) -> SignClass:
+    """Classify a hand landmark frame into a known sign (or none)."""
+    flags = finger_extension_flags(landmarks)
+    if not flags:
+        return "none"
+
+    index = flags["index"]
+    middle = flags["middle"]
+    ring = flags["ring"]
+    pinky = flags["pinky"]
+    thumb_up = flags["thumb_up"]
+    thumb_down = flags["thumb_down"]
+    frames = buffer or []
+    motion = hand_motion_energy(frames)
+    wag = buffer_looks_like_wave(frames)
+
+    # Motion Goodbye beats still Hello when a real wag is present.
+    if wag and index and middle:
+        return "wave"
+
+    # More specific finger combinations first so they are not stolen by
+    # thumbs-up / pointing / open-palm / wave.
+    if thumb_up and index and pinky and not middle and not ring:
+        return "i_love_you"
+
+    # Pinky-only You before Please — a resting thumb often still flags thumb_up
+    # and used to steal You as shaka/Please.
+    if looks_like_you(landmarks):
+        return "you"
+
+    if looks_like_please(landmarks):
+        return "please"
+
+    if looks_like_thumbs_up(landmarks):
+        return "thumbs_up"
+
+    if thumb_down and _fingers_clearly_curled(landmarks):
+        return "thumbs_down"
+
+    # Undo — one thumb sideways (both sideways thumbs = Clear via dual-hand).
+    if looks_like_thumb_sideways(landmarks):
+        return "four"
+
+    # Face-near signs before generic pointing.
+    if looks_like_water(landmarks):
+        return "water"
+
+    if looks_like_food(landmarks):
+        return "food"
+
+    if index and middle and ring and not pinky and not thumb_up:
+        return "want"
+
+    if index and middle and not ring and not pinky and not thumb_up:
+        return "peace_sign"
+
+    if looks_like_direction(landmarks):
+        return "direction"
+
+    if looks_like_help_point(landmarks) or (
+        index and not middle and not ring and not pinky and not thumb_up
+    ):
+        return "pointing"
+
+    if pinky and not index and not middle and not ring and not looks_like_please(
+        landmarks
+    ):
+        return "you"
+
+    if (not index) and middle and ring and pinky and not thumb_up:
+        return "okay"
+
+    # Closed fist alone is no longer Clear (Clear = both thumbs sideways).
+    # Still open palm = Hello. Moving palm without a confirmed wag stays none
+    # so Hello does not steal Goodbye mid-motion.
+    if looks_like_open_palm(landmarks):
+        if motion >= HAND_MOTION_ACTIVE_THRESHOLD and not wag:
+            return "none"
+        return "open_palm"
+
+    # Four fingers with thumb tucked used to be Undo — now unused so it
+    # cannot steal Hello. Prefer open palm only when thumb is clearly out.
+    if index and middle and ring and pinky:
+        if motion >= HAND_MOTION_ACTIVE_THRESHOLD and not wag:
+            return "none"
+        if flags["thumb"] or thumb_up:
+            return "open_palm"
+        return "none"
+
+    return "none"
+
+
+def classify_gesture_attempt(
+    landmarks: dict[str, Any],
+    mode: str = "aviation",
+    buffer: list[dict[str, Any]] | None = None,
+) -> GestureClass:
+    """Cheap heuristic: what gesture is being attempted, if any.
+
+    Branches by mode — aviation uses arm/shoulder geometry; sign_language uses
+    finger tip / joint positions on the primary hand.
+    """
+    if mode == "sign_language":
+        return classify_sign_attempt(landmarks, buffer)
+    label, _debug = classify_aviation_attempt(landmarks)
+    return label
+
+
+def aviation_motion_energy(buffer: list[dict[str, Any]]) -> float:
+    """Mean wrist displacement between consecutive buffered frames."""
+    if len(buffer) < 2:
+        return 0.0
+    deltas: list[float] = []
+    prev_l = _point(buffer[0], "leftWrist")
+    prev_r = _point(buffer[0], "rightWrist")
+    for frame in buffer[1:]:
+        left = _point(frame, "leftWrist")
+        right = _point(frame, "rightWrist")
+        if prev_l and left:
+            deltas.append(_dist2(prev_l, left))
+        if prev_r and right:
+            deltas.append(_dist2(prev_r, right))
+        prev_l, prev_r = left, right
+    if not deltas:
+        return 0.0
+    return float(np.mean(deltas))
+
+
+def is_aviation_idle(buffer: list[dict[str, Any]]) -> bool:
+    """True when the trainee is standing still (no meaningful arm motion)."""
+    if len(buffer) < AVIATION_IDLE_MIN_FRAMES:
+        return False
+    return aviation_motion_energy(buffer) < AVIATION_IDLE_MOTION_THRESHOLD
+
+
+def seatbelt_closing_delta(landmark_sequence: list[dict[str, Any]]) -> float | None:
+    """How much wrist separation decreased over the buffer (positive = closing)."""
+    separations: list[float] = []
+    for frame in landmark_sequence:
+        left = _point(frame, "leftWrist")
+        right = _point(frame, "rightWrist")
+        if left and right:
+            separations.append(abs(float(right["x"]) - float(left["x"])))
+    if len(separations) < 3:
+        return None
+    early = float(np.mean(separations[: max(1, len(separations) // 3)]))
+    late = float(np.mean(separations[-max(1, len(separations) // 3) :]))
+    return early - late
+
+
+def _horizontal_alignment_score(
+    landmarks: dict[str, Any],
+    y_tol: float,
+) -> tuple[float, list[dict[str, Any]], list[str]]:
+    """Score how level wrists are with the shoulder line; return hints."""
+    deviations: list[dict[str, Any]] = []
+    hints: list[str] = []
+    scores: list[float] = []
+
+    for side in ("left", "right"):
+        shoulder = _point(landmarks, f"{side}Shoulder")
+        wrist = _point(landmarks, f"{side}Wrist")
+        if not shoulder or not wrist:
+            continue
+        # y grows downward — positive delta means wrist below shoulder.
+        delta_y = float(wrist["y"]) - float(shoulder["y"])
+        score = max(0.0, 1.0 - (abs(delta_y) / max(y_tol, 1e-6)))
+        scores.append(score)
+        deviations.append(
+            {
+                "joint": f"{side}_wrist_height",
+                "expected": "wrist near shoulder height",
+                "actual": round(delta_y, 4),
+                "error": round(abs(delta_y), 4),
+                "tolerance": y_tol,
+                "arm_score": round(score, 4),
+            }
+        )
+        if delta_y > y_tol:
+            hints.append(f"Raise your {side} arm toward shoulder height")
+        elif delta_y < -y_tol:
+            hints.append(f"Lower your {side} arm slightly toward the shoulder line")
+
+    if not scores:
+        return 0.0, deviations, hints
+    return float(np.mean(scores)), deviations, hints
+
+
+def score_pose(
+    landmarks: dict[str, Any],
+    reference: PoseReference,
+) -> dict[str, Any]:
+    """Score exit_pointing from elbow angles + horizontal wrist alignment."""
+    deviations: list[dict[str, Any]] = []
+    hints: list[str] = []
+
+    target = float(reference["target_elbow_angle_deg"])
+    angle_tol = float(reference["elbow_angle_tolerance_deg"])
+    match_threshold = float(reference["match_threshold"])
+    y_tol = float(reference.get("horizontal_y_tolerance", 0.10))
+
+    left_arm_angle: float | None = None
+    right_arm_angle: float | None = None
+    left_arm_score = 0.0
+    right_arm_score = 0.0
+    arms_scored = 0
+
+    for side in ("left", "right"):
+        shoulder = _point(landmarks, f"{side}Shoulder")
+        elbow = _point(landmarks, f"{side}Elbow")
+        wrist = _point(landmarks, f"{side}Wrist")
+
+        if not shoulder or not elbow or not wrist:
+            deviations.append(
+                {
+                    "joint": f"{side}_arm",
+                    "issue": "missing_landmarks",
+                    "expected": "shoulder, elbow, wrist",
+                    "actual": None,
+                }
+            )
+            hints.append(f"Keep your {side} arm fully visible")
+            continue
+
+        angle = joint_angle_deg(shoulder, elbow, wrist)
+        deviation = abs(angle - target)
+        arm_score = max(0.0, 1.0 - (deviation / angle_tol))
+        arms_scored += 1
+
+        if side == "left":
+            left_arm_angle = round(angle, 2)
+            left_arm_score = arm_score
+        else:
+            right_arm_angle = round(angle, 2)
+            right_arm_score = arm_score
+
+        deviations.append(
+            {
+                "joint": f"{side}_elbow_angle",
+                "expected": target,
+                "actual": round(angle, 2),
+                "error": round(deviation, 2),
+                "tolerance": angle_tol,
+                "arm_score": round(arm_score, 4),
+            }
+        )
+        if angle < target - angle_tol * 0.45:
+            hints.append(f"Straighten your {side} arm more")
+        elif angle > target + angle_tol * 0.55:
+            hints.append(f"Relax your {side} elbow slightly")
+
+    angle_score = (
+        (left_arm_score + right_arm_score) / 2.0 if arms_scored else 0.0
+    )
+    horiz_score, horiz_devs, horiz_hints = _horizontal_alignment_score(
+        landmarks, y_tol
+    )
+    deviations.extend(horiz_devs)
+    hints.extend(horiz_hints)
+
+    # Elbow shape carries more weight; horizontal line still matters.
+    final_score = 0.7 * angle_score + 0.3 * horiz_score
+    matched = final_score >= match_threshold
+    # Pass band shown in UI = how far from target still scores >= match_threshold
+    # for the elbow term alone: (1 - match) * tol
+    pass_band_deg = round((1.0 - match_threshold) * angle_tol / 0.7, 1)
+
+    print(
+        f"[score_pose] L_angle={left_arm_angle} R_angle={right_arm_angle} "
+        f"target={target} tol={angle_tol} "
+        f"angle_score={angle_score:.4f} horiz={horiz_score:.4f} "
+        f"final={final_score:.4f} matched={matched}"
+    )
+
+    return {
+        "matched": matched,
+        "correct": matched,
+        "score": round(final_score, 4),
+        "deviations": deviations,
+        "hints": hints[:3],
+        "left_arm_angle": left_arm_angle,
+        "right_arm_angle": right_arm_angle,
+        "left_arm_score": round(left_arm_score, 4),
+        "right_arm_score": round(right_arm_score, 4),
+        "horizontal_score": round(horiz_score, 4),
+        "target_angle": target,
+        "tolerance": angle_tol,
+        "pass_band_deg": pass_band_deg,
+    }
+
+
+
+def _feature_match_score(
+    live: list[float],
+    ref_features: list[float],
+    tolerance: float,
+) -> tuple[float, dict[str, Any]]:
+    """Combine L1 and cosine so modest scale/angle drift still scores well."""
+    live_a = np.asarray(live, dtype=float)
+    ref_a = np.asarray(ref_features, dtype=float)
+    mean_err = float(np.mean(np.abs(live_a - ref_a)))
+    l1_score = max(0.0, 1.0 - (mean_err / max(tolerance, 1e-6)))
+
+    denom = float(np.linalg.norm(live_a) * np.linalg.norm(ref_a)) + 1e-8
+    cosine = float(np.dot(live_a, ref_a) / denom)
+    # Map cosine [-1, 1] → [0, 1]
+    cosine_score = max(0.0, min(1.0, (cosine + 1.0) / 2.0))
+
+    score = max(l1_score, cosine_score)
+    detail = {
+        "joint": "hand_features",
+        "expected": "feature match within tolerance / cosine",
+        "actual": round(mean_err, 4),
+        "error": round(mean_err, 4),
+        "tolerance": tolerance,
+        "l1_score": round(l1_score, 4),
+        "cosine": round(cosine, 4),
+        "cosine_score": round(cosine_score, 4),
+        "feature_dims": len(live),
+    }
+    return score, detail
+
+
+def score_hand_pose(
+    landmarks: dict[str, Any],
+    reference: PoseReference,
+    gesture: str,
+    *,
+    recognition_threshold: float | None = None,
+) -> dict[str, Any]:
+    """Score a held hand shape — hybrid of recorded features + finger heuristics.
+
+    Recorded templates alone are brittle (distance/angle). Heuristics alone are
+    noisy. Taking the max keeps a clear open-palm from scoring 0% against a
+    slightly different recording.
+    """
+    threshold = (
+        float(recognition_threshold)
+        if recognition_threshold is not None
+        else float(reference.get("match_threshold", SIGN_RECOGNITION_THRESHOLD))
+    )
+    # Looser than calibration default so re-tests after record still match.
+    tolerance = float(reference.get("feature_tolerance", 0.85))
+    if tolerance < 0.85:
+        tolerance = 0.85
+    ref_features = reference.get("reference_features")
+    deviations: list[dict[str, Any]] = []
+
+    live = hand_pose_features(landmarks)
+    if live is None:
+        return {
+            "matched": False,
+            "correct": False,
+            "score": 0.0,
+            "deviations": [
+                {
+                    "joint": "hand",
+                    "issue": "missing_landmarks",
+                    "expected": "full hand landmark set",
+                    "actual": None,
+                }
+            ],
+        }
+
+    heuristic = _heuristic_sign_score(landmarks, gesture)
+    feature_score: float | None = None
+
+    if isinstance(ref_features, list) and len(ref_features) == len(live):
+        feature_score, feature_detail = _feature_match_score(
+            live, ref_features, tolerance
+        )
+        deviations.append(feature_detail)
+        # A recorded template must not override a hand shape that does not match.
+        if heuristic < 0.4:
+            score = heuristic
+        else:
+            score = max(float(feature_score), heuristic)
+        deviations.append(
+            {
+                "joint": "hand_hybrid",
+                "feature_score": round(float(feature_score), 4),
+                "heuristic_score": round(heuristic, 4),
+                "combined": round(score, 4),
+            }
+        )
+    else:
+        score = heuristic
+        deviations.append(
+            {
+                "joint": "hand_heuristic",
+                "expected": f"clear {gesture} finger pattern",
+                "actual": round(score, 4),
+                "note": "no reference_features of matching length",
+                "ref_len": len(ref_features) if isinstance(ref_features, list) else None,
+                "live_len": len(live),
+            }
+        )
+
+    if gesture == "thumbs_up" and looks_like_fist(landmarks):
+        score = min(score, 0.22)
+    if gesture == "thumbs_up" and looks_like_you(landmarks):
+        score = min(score, 0.12)
+    if gesture == "please" and looks_like_you(landmarks):
+        score = min(score, 0.12)
+    if gesture == "please" and looks_like_please(landmarks):
+        score = max(score, 0.92)
+    if gesture == "you" and looks_like_you(landmarks):
+        score = max(score, 0.92)
+    if gesture == "you" and looks_like_please(landmarks):
+        score = min(score, 0.18)
+    if gesture == "you" and looks_like_thumbs_up(landmarks):
+        score = min(score, 0.20)
+    if gesture == "fist" and looks_like_thumbs_up(landmarks):
+        score = min(score, 0.22)
+    if gesture == "fist" and looks_like_thumb_sideways(landmarks):
+        score = min(score, 0.30)
+    if gesture == "fist" and looks_like_fist(landmarks):
+        score = min(score, 0.20)
+    if gesture == "thumbs_up" and looks_like_thumbs_up(landmarks):
+        score = max(score, 0.90)
+    if gesture == "open_palm" and looks_like_open_palm(landmarks):
+        score = max(score, 0.88)
+    if gesture == "open_palm" and looks_like_four(landmarks):
+        score = min(score, 0.35)
+    if gesture == "open_palm" and looks_like_thumb_sideways(landmarks):
+        score = min(score, 0.15)
+    if gesture == "open_palm" and looks_like_fist(landmarks):
+        score = min(score, 0.20)
+    if gesture == "four" and looks_like_thumb_sideways(landmarks):
+        score = max(score, 0.92)
+    if gesture == "four" and looks_like_four(landmarks):
+        score = min(score, 0.15)
+    if gesture == "four" and looks_like_open_palm(landmarks):
+        score = min(score, 0.12)
+    if gesture == "direction" and looks_like_direction(landmarks):
+        score = max(score, 0.92)
+    if gesture == "pointing" and looks_like_direction(landmarks):
+        score = min(score, 0.18)
+    if gesture == "pointing" and looks_like_help_point(landmarks):
+        score = max(score, 0.90)
+    if gesture == "water" and looks_like_water(landmarks):
+        score = max(score, 0.90)
+    if gesture == "food" and looks_like_food(landmarks):
+        score = max(score, 0.90)
+    if gesture == "fist" and looks_like_food(landmarks):
+        score = min(score, 0.22)
+    if gesture == "fist" and looks_like_water(landmarks):
+        score = min(score, 0.22)
+    if gesture == "pointing" and looks_like_water(landmarks):
+        score = min(score, 0.15)
+    if gesture == "open_palm" and looks_like_food(landmarks):
+        score = min(score, 0.18)
+    if gesture == "four" and looks_like_food(landmarks):
+        score = min(score, 0.18)
+
+    matched = score >= threshold
+    return {
+        "matched": matched,
+        "correct": matched,
+        "score": round(score, 4),
+        "deviations": deviations,
+    }
+
+
+def score_all_sign_poses(landmarks: dict[str, Any]) -> dict[str, float]:
+    """Compute match scores against every held-pose sign reference.
+
+    Returns scores for all signs. Gestures with saved ``reference_features`` use
+    feature matching; others fall back to finger-pattern heuristics.
+    """
+    from app.scoring.reference_gestures import get_reference
+
+    scores: dict[str, float] = {}
+    for gesture in SIGN_POSE_GESTURES:
+        result = score_hand_pose(
+            landmarks,
+            get_reference(gesture),
+            gesture,
+            recognition_threshold=SIGN_RECOGNITION_THRESHOLD,
+        )
+        scores[gesture] = float(result.get("score") or 0.0)
+    return scores
+
+
+def best_sign_pose(
+    landmarks: dict[str, Any],
+    *,
+    classified_attempt: str | None = None,
+) -> tuple[str | None, float, dict[str, float], dict[str, Any]]:
+    """Pick the best pose sign from hybrid scores (features ∪ heuristics).
+
+    When the finger classifier names an attempt, that sign gets a small boost so
+    a clear open-palm isn't beaten by a partial peace/pointing heuristic.
+    """
+    from app.scoring.reference_gestures import get_reference
+
+    scores = score_all_sign_poses(landmarks)
+    if (
+        classified_attempt in SIGN_POSE_GESTURES
+        and classified_attempt in scores
+    ):
+        # Prefer the classified shape when fingers already match it.
+        scores[classified_attempt] = min(
+            1.0, float(scores[classified_attempt]) + 0.08
+        )
+
+    chosen = max(scores, key=scores.get) if scores else None
+    chosen_score = float(scores.get(chosen, 0.0)) if chosen else 0.0
+
+    # Reject near-ties unless the finger classifier already named that sign.
+    if chosen is not None and scores:
+        ranked = sorted(scores.values(), reverse=True)
+        if (
+            len(ranked) >= 2
+            and ranked[0] - ranked[1] < 0.06
+            and classified_attempt not in (chosen, None)
+        ):
+            if (
+                classified_attempt in SIGN_POSE_GESTURES
+                and classified_attempt in scores
+                and float(scores[classified_attempt]) >= SIGN_ATTEMPT_FEEDBACK_THRESHOLD
+            ):
+                chosen = classified_attempt
+                chosen_score = float(scores[classified_attempt])
+            else:
+                return None, ranked[0], scores, {}
+
+    if chosen is None:
+        return None, 0.0, scores, {}
+
+    detail = score_hand_pose(
+        landmarks,
+        get_reference(chosen),
+        chosen,
+        recognition_threshold=SIGN_RECOGNITION_THRESHOLD,
+    )
+    # Keep the (possibly boosted) chosen score for thresholding / UI.
+    detail = {**detail, "score": round(chosen_score, 4)}
+    return chosen, chosen_score, scores, detail
+
+
+def wrist_features_relative_to_waist(landmarks: dict[str, Any]) -> list[float] | None:
+    """Return [lx, ly, rx, ry] of wrists relative to mid-hip, or None if incomplete."""
+    left_hip = _point(landmarks, "leftHip")
+    right_hip = _point(landmarks, "rightHip")
+    left_wrist = _point(landmarks, "leftWrist")
+    right_wrist = _point(landmarks, "rightWrist")
+
+    if not left_hip or not right_hip or not left_wrist or not right_wrist:
+        return None
+
+    mid_x = (left_hip["x"] + right_hip["x"]) / 2.0
+    mid_y = (left_hip["y"] + right_hip["y"]) / 2.0
+
+    return [
+        left_wrist["x"] - mid_x,
+        left_wrist["y"] - mid_y,
+        right_wrist["x"] - mid_x,
+        right_wrist["y"] - mid_y,
+    ]
+
+
+def _center_wave_xy(series: list[list[float]]) -> np.ndarray:
+    """Remove absolute camera position so a recorded wave matches anywhere in frame."""
+    arr = np.asarray(series, dtype=float)
+    if arr.size == 0 or arr.shape[1] < 2:
+        return arr
+    origin = arr[:, :2].mean(axis=0)
+    centered = arr.copy()
+    centered[:, 0] -= origin[0]
+    centered[:, 1] -= origin[1]
+    return centered
+
+
+def score_motion(
+    landmark_sequence: list[dict[str, Any]],
+    reference: MotionReference,
+) -> dict[str, Any]:
+    """Compare a buffered feature sequence to a motion reference via FastDTW."""
+    deviations: list[dict[str, Any]] = []
+    hints: list[str] = []
+    match_threshold = float(reference["match_threshold"])
+    feature_kind = reference.get("feature_kind", "wrist_waist")
+    ref_len = len(reference["reference_sequence"])
+    if feature_kind == "hand_wave":
+        min_frames = min(max(3, ref_len // 2), 5)
+    else:
+        min_frames = max(3, ref_len // 2)
+
+    feature_fn = (
+        hand_wave_features if feature_kind == "hand_wave" else wrist_features_relative_to_waist
+    )
+
+    live_series: list[list[float]] = []
+    for frame in landmark_sequence:
+        features = feature_fn(frame)
+        if features is not None:
+            live_series.append(features)
+
+    ref_series = [list(map(float, row)) for row in reference["reference_sequence"]]
+
+    if len(live_series) < min_frames:
+        progress = (
+            float(len(live_series)) / float(min_frames) if min_frames > 0 else 0.0
+        )
+        return {
+            "matched": False,
+            "correct": False,
+            "score": 0.0,
+            "ready": False,
+            "buffer_frames": len(live_series),
+            "buffer_needed": min_frames,
+            "buffer_progress": round(min(1.0, progress), 3),
+            "deviations": [
+                {
+                    "joint": "motion_buffer",
+                    "issue": "insufficient_frames",
+                    "expected": f">= {min_frames} valid frames",
+                    "actual": len(live_series),
+                }
+            ],
+            "hints": ["Bring both hands toward your waist and slide them together"],
+        }
+
+    closing = None
+    if feature_kind == "wrist_waist":
+        closing = seatbelt_closing_delta(landmark_sequence)
+        if closing is not None and closing < SEATBELT_MIN_CLOSING_DELTA:
+            deviations.append(
+                {
+                    "joint": "seatbelt_closing",
+                    "issue": "no_closing_motion",
+                    "expected": f"wrist separation decrease >= {SEATBELT_MIN_CLOSING_DELTA}",
+                    "actual": round(float(closing), 4),
+                }
+            )
+            return {
+                "matched": False,
+                "correct": False,
+                "score": round(
+                    max(
+                        0.0,
+                        min(0.45, float(closing) / SEATBELT_MIN_CLOSING_DELTA * 0.45),
+                    ),
+                    4,
+                ),
+                "ready": True,
+                "closing_delta": round(float(closing), 4),
+                "deviations": deviations,
+                "hints": [
+                    "Slide both hands together across your waist — keep moving until they meet"
+                ],
+            }
+
+    max_distance = float(reference["max_dtw_distance"])
+    if feature_kind == "hand_wave":
+        live = _center_wave_xy(live_series)
+        ref = _center_wave_xy(ref_series)
+        max_distance = max(max_distance, 1.8)
+        match_threshold = min(match_threshold, 0.55)
+    else:
+        live = np.asarray(live_series, dtype=float)
+        ref = np.asarray(ref_series, dtype=float)
+
+    distance, _path = fastdtw(live, ref, dist=_euclidean)
+    score = max(0.0, min(1.0, 1.0 - (float(distance) / max_distance)))
+
+    deviations.append(
+        {
+            "joint": "motion_dtw",
+            "expected": f"DTW distance < {max_distance}",
+            "actual": round(float(distance), 4),
+            "error": round(float(distance), 4),
+            "tolerance": max_distance,
+            "feature_kind": feature_kind,
+        }
+    )
+    if closing is not None:
+        deviations.append(
+            {
+                "joint": "seatbelt_closing",
+                "expected": f">= {SEATBELT_MIN_CLOSING_DELTA}",
+                "actual": round(float(closing), 4),
+            }
+        )
+
+    matched = score >= match_threshold
+    if not matched:
+        hints.append("Keep both hands near your waist and close them more smoothly")
+
+    return {
+        "matched": matched,
+        "correct": matched,
+        "score": round(score, 4),
+        "ready": True,
+        "dtw_distance": round(float(distance), 4),
+        "closing_delta": round(float(closing), 4) if closing is not None else None,
+        "deviations": deviations,
+        "hints": hints,
+    }
+
+
+
+def meaning_for(gesture: str) -> str | None:
+    return SIGN_MEANINGS.get(gesture)

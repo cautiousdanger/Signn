@@ -1,0 +1,22 @@
+{
+  "dataset": "isl_include50",
+  "status": "ready",
+  "samples": 80,
+  "classes": [
+    "clean",
+    "deep",
+    "dirty",
+    "hard",
+    "high",
+    "low",
+    "shallow",
+    "soft",
+    "strong",
+    "weak"
+  ],
+  "train_accuracy": 0.9625,
+  "feature_dim": 30,
+  "onnx": true,
+  "updated_at": "2026-09-29T08:15:38.977094+00:00",
+  "note": "Trained Softmax on pooled MediaPipe hand features (10 classes)"
+}

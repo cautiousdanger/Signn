@@ -1,0 +1,4 @@
+# Large training intermediates (keep trained model.onnx/json in artifacts/)
+keypoints/
+models/
+__pycache__/

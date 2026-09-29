@@ -1,0 +1,14 @@
+# Large downloads live under this folder (tracked via README only).
+*
+!.gitignore
+!README.md
+!INCLUDE/
+!INCLUDE/README.md
+!MS-ASL/
+!MS-ASL/README.md
+INCLUDE/**
+!INCLUDE/README.md
+MS-ASL/**
+!MS-ASL/README.md
+!MS-ASL/meta/
+!MS-ASL/meta/classes100.json
