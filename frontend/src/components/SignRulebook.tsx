@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useState } from "react";
 
 import { SIGN_VOCAB, type SignGesture } from "../lib/signVocab";
 
@@ -29,12 +29,6 @@ export function SignRulebook({
 }: SignRulebookProps) {
   const [detailOpen, setDetailOpen] = useState(false);
 
-  useEffect(() => {
-    if (!open) {
-      setDetailOpen(false);
-    }
-  }, [open]);
-
   if (!open) {
     return null;
   }
@@ -52,22 +46,27 @@ export function SignRulebook({
     setDetailOpen(true);
   }
 
+  function handleClose() {
+    setDetailOpen(false);
+    onClose();
+  }
+
   return (
     <>
       <aside
-        className="panel absolute left-0 top-0 z-20 flex max-h-[calc(100vh-7rem)] w-[min(100%,21rem)] flex-col overflow-hidden rounded-l-none border-l-0"
-        aria-label="Sign rulebook"
+        className="panel absolute left-0 top-0 z-20 flex max-h-[calc(100vh-7rem)] w-[min(100%,20rem)] flex-col overflow-hidden rounded-l-none border-l-0 shadow-panel"
+        aria-label="Sign guide"
       >
-        <div className="flex shrink-0 items-start justify-between gap-3 border-b border-ink/8 px-5 py-4">
+        <div className="flex shrink-0 items-start justify-between gap-3 border-b border-ink/8 px-4 py-3.5">
           <div>
-            <h2 className="font-heading text-xl font-medium text-ink">Signs</h2>
+            <h2 className="font-heading text-lg font-medium text-ink">Signs</h2>
             <p className="mt-1 text-xs leading-relaxed text-muted">
-              Tap a word to open how-to steps in a separate box.
+              Tap a word for how-to steps.
             </p>
           </div>
           <button
             type="button"
-            onClick={onClose}
+            onClick={handleClose}
             className="nav-pill shrink-0 !px-3 !py-1.5"
           >
             Close

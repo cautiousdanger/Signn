@@ -1,0 +1,644 @@
+  if (isStreaming) {
+    const connectionLabel =
+      wsStatus === "connected"
+        ? "Connected"
+        : wsStatus === "connecting"
+          ? "Connecting…"
+          : wsStatus === "reconnecting"
+            ? "Reconnecting…"
+            : "Offline";
+    const connectionTone =
+      wsStatus === "connected"
+        ? "status-pill-ok"
+        : wsStatus === "connecting" || wsStatus === "reconnecting"
+          ? "status-pill-warn"
+          : "status-pill-bad";
+    const cameraLiveLabel = limbsNotVisible
+      ? mode === "sign_language"
+        ? "Move closer"
+        : "Step back"
+      : "Camera ready";
+    const detectedOverlay =
+      mode === "sign_language" &&
+      gestureFeedback &&
+      gestureFeedback.gesture !== "none"
+        ? gestureFeedback.correct && gestureFeedback.meaning
+          ? `Detected: ${gestureFeedback.meaning}`
+          : gestureFeedback.gesture in GESTURE_LABELS
+            ? `Seeing: ${GESTURE_LABELS[gestureFeedback.gesture as CalibrationGesture]}`
+            : "Recognizing…"
+        : null;
+    const showWelcome =
+      mode === "sign_language" &&
+      conversation.length === 0 &&
+      !userSentence &&
+      !assistantReply &&
+      sentenceTokens.length === 0;
+
+    return (
+      <div className="app-shell">
+        <header className="app-topbar">
+          <div className="min-w-0 flex-1 basis-[11rem]">
+            <div className="flex items-center gap-2.5">
+              <span
+                className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-accent text-sm font-bold text-white"
+                aria-hidden
+              >
+                G
+              </span>
+              <div className="min-w-0">
+                <p className="truncate font-heading text-lg font-medium leading-tight text-ink">
+                  Gesture
+                </p>
+                <p className="truncate text-xs text-muted">
+                  {mode === "sign_language"
+                    ? "Sign language communication"
+                    : "Aviation practice"}
+                </p>
+              </div>
+            </div>
+          </div>
+
+          {mode === "sign_language" && (
+            <button
+              type="button"
+              onClick={() => setRulebookOpen((open) => !open)}
+              className={`nav-pill shrink-0 ${rulebookOpen ? "nav-pill-active" : ""}`}
+            >
+              Signs
+            </button>
+          )}
+          <button
+            type="button"
+            onClick={() => setCalibrationOpen((open) => !open)}
+            className={`nav-pill shrink-0 ${calibrationOpen ? "nav-pill-active" : ""}`}
+          >
+            Record
+          </button>
+          {mode === "sign_language" && (
+            <button
+              type="button"
+              onClick={() => setTrainOpen((open) => !open)}
+              className={`nav-pill shrink-0 ${trainOpen ? "nav-pill-active" : ""}`}
+            >
+              Train
+            </button>
+          )}
+          <button
+            type="button"
+            onClick={stopWebcam}
+            className="nav-pill shrink-0"
+          >
+            Change mode
+          </button>
+          <Link href="/history" className="nav-pill shrink-0">
+            History
+          </Link>
+          <div className={`status-pill shrink-0 ${connectionTone}`} role="status">
+            <span
+              className={`status-dot ${
+                wsStatus === "connected"
+                  ? "bg-success"
+                  : wsStatus === "connecting" || wsStatus === "reconnecting"
+                    ? "bg-accent pulse-soft"
+                    : "bg-alert"
+              }`}
+              aria-hidden
+            />
+            {connectionLabel}
+          </div>
+        </header>
+
+        {showWelcome ? (
+          <div className="border-b border-ink/8 px-4 py-3 sm:px-6">
+            <h1 className="font-heading text-xl font-medium text-ink sm:text-2xl">
+              Ready to communicate
+            </h1>
+            <p className="mt-1 max-w-2xl text-sm text-muted">
+              Sign naturally. We&apos;ll recognize your signs and help you
+              express them.
+            </p>
+          </div>
+        ) : null}
+
+        <div className="workspace relative">
+          {mode === "sign_language" && (
+            <SignRulebook
+              open={rulebookOpen}
+              selectedGesture={selectedRulebookGesture}
+              referenceStatus={referenceStatus}
+              recordBusy={calibrationBusy}
+              onClose={() => setRulebookOpen(false)}
+              onSelect={setSelectedRulebookGesture}
+              onRecord={(gesture) => {
+                setCalibrationOpen(true);
+                void runCalibration(gesture);
+              }}
+              onResetOne={(gesture) => {
+                void resetOneRecordedReference(gesture);
+              }}
+              onResetAll={() => {
+                void resetAllRecordedReferences();
+              }}
+            />
+          )}
+
+          <div className="workspace-camera">
+            <div className="hud-frame relative aspect-video w-full bg-ink">
+              <div className="hud-corners" aria-hidden />
+              <div className="safe-zone" aria-hidden />
+              <video
+                ref={videoRef}
+                autoPlay
+                playsInline
+                muted
+                className="absolute inset-0 h-full w-full object-contain"
+              />
+              <canvas
+                ref={canvasRef}
+                className="pointer-events-none absolute inset-0 h-full w-full object-contain"
+              />
+              <div className="camera-badge left-3 top-3">
+                <span
+                  className={`status-dot ${
+                    limbsNotVisible ? "bg-alert" : "bg-success"
+                  }`}
+                  aria-hidden
+                />
+                {cameraLiveLabel}
+              </div>
+              <div className="camera-badge right-3 top-3">{connectionLabel}</div>
+              {detectedOverlay ? (
+                <div className="camera-detect" aria-live="polite">
+                  {detectedOverlay}
+                </div>
+              ) : mode === "sign_language" ? (
+                <div className="camera-detect opacity-80">
+                  Keep hands inside the frame
+                </div>
+              ) : null}
+
+              {limbsNotVisible && (
+                <div className="pointer-events-none absolute left-1/2 top-14 z-10 -translate-x-1/2 rounded-full bg-alert px-4 py-2 text-xs font-semibold text-white">
+                  {mode === "sign_language"
+                    ? "Move closer — hand not fully visible"
+                    : "Move back — arms not fully visible"}
+                </div>
+              )}
+
+              {calibrationPhase === "countdown" && (
+                <div className="pointer-events-none absolute inset-0 z-20 flex flex-col items-center justify-center bg-ink/50 backdrop-blur-[2px]">
+                  <span className="font-heading text-8xl font-medium text-white tabular-nums">
+                    {countdown}
+                  </span>
+                  <span className="mt-3 text-sm text-white/85">
+                    Get into position —{" "}
+                    {calibrationGesture
+                      ? GESTURE_LABELS[calibrationGesture]
+                      : "gesture"}
+                  </span>
+                </div>
+              )}
+              {calibrationPhase === "recording" && (
+                <div className="pointer-events-none absolute inset-x-0 bottom-16 z-20 flex justify-center">
+                  <div className="rounded-full bg-alert px-4 py-2 text-xs font-semibold text-white">
+                    Recording… {Math.round(recordProgress * 100)}%
+                  </div>
+                </div>
+              )}
+            </div>
+            {mode === "sign_language" ? (
+              <p className="px-1 text-xs leading-relaxed text-muted">
+                Good lighting helps recognition. Sign one word at a time, then
+                hold still.
+              </p>
+            ) : null}
+          </div>
+
+          <aside className="workspace-side">
+            {mode === "sign_language" && (
+              <SignTrainer
+                open={trainOpen}
+                stats={mlStats}
+                selectedGesture={selectedTrainGesture}
+                recordBusy={calibrationBusy}
+                trainBusy={trainBusy}
+                error={trainError}
+                liveTest={liveTest}
+                onClose={() => setTrainOpen(false)}
+                onSelect={setSelectedTrainGesture}
+                onAddSamples={(gesture) => {
+                  setSelectedTrainGesture(gesture);
+                  void addTrainingSamples(gesture);
+                }}
+                onTrain={() => {
+                  void trainSignModel();
+                }}
+                onPromote={() => {
+                  void promoteSignModel();
+                }}
+                onUseRules={() => {
+                  void useRulesAgain();
+                }}
+              />
+            )}
+            {calibrationOpen && (
+              <div className="panel fade-up border-accent/30 p-5">
+                <div className="flex items-start justify-between gap-3">
+                  <div>
+                    <h2 className="font-heading text-xl font-medium text-ink">
+                      Record reference
+                    </h2>
+                    <p className="mt-1 text-xs leading-relaxed text-muted">
+                      {mode === "sign_language"
+                        ? "Save your hand once so recognition matches you better."
+                        : "Replace the built-in defaults with your own gestures."}
+                    </p>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      cancelCalibration();
+                      setCalibrationOpen(false);
+                    }}
+                    className="nav-pill shrink-0 !px-3 !py-1.5"
+                  >
+                    Close
+                  </button>
+                </div>
+
+                <dl className="mt-4 max-h-48 space-y-2 overflow-y-auto border-t border-ink/8 pt-4 text-xs">
+                  {calibrationGestures.map((gesture) => (
+                    <div
+                      key={gesture}
+                      className="flex items-center justify-between gap-2"
+                    >
+                      <dt className="text-muted">
+                        {GESTURE_LABELS[gesture]}
+                        {mode === "sign_language" && (
+                          <span className="text-ink/35">
+                            {" "}
+                            · {SIGN_MEANINGS[gesture as SignGesture]}
+                          </span>
+                        )}
+                      </dt>
+                      <dd
+                        className={
+                          referenceStatus?.[gesture] === "recorded"
+                            ? "shrink-0 font-semibold text-success"
+                            : "shrink-0 text-muted"
+                        }
+                      >
+                        {referenceStatus
+                          ? referenceStatus[gesture] === "recorded"
+                            ? "Recorded"
+                            : "Default"
+                          : "…"}
+                      </dd>
+                    </div>
+                  ))}
+                </dl>
+
+                <div className="mt-4 flex max-h-56 flex-col gap-2 overflow-y-auto">
+                  {calibrationGestures.map((gesture) => (
+                    <button
+                      key={gesture}
+                      type="button"
+                      onClick={() => runCalibration(gesture)}
+                      disabled={calibrationBusy}
+                      className="btn-secondary w-full !min-h-11 justify-between px-3 py-2 text-left text-sm"
+                    >
+                      Record {GESTURE_LABELS[gesture]}
+                      <span className="ml-1 text-xs text-muted">
+                        ({RECORD_DURATION_MS[gesture] / 1000}s)
+                      </span>
+                    </button>
+                  ))}
+                </div>
+
+                <button
+                  type="button"
+                  onClick={() => void resetAllRecordedReferences()}
+                  disabled={calibrationBusy}
+                  className="btn-secondary mt-3 w-full"
+                >
+                  Clear all recorded references
+                </button>
+
+                {calibrationPhase === "recording" && (
+                  <div className="mt-4">
+                    <div className="mb-1.5 flex items-center justify-between text-xs">
+                      <span className="font-semibold text-alert">Recording…</span>
+                      <span className="text-muted tabular-nums">
+                        {Math.round(recordProgress * 100)}%
+                      </span>
+                    </div>
+                    <div className="progress-track">
+                      <div
+                        className="progress-fill bg-alert"
+                        style={{
+                          width: `${Math.round(recordProgress * 100)}%`,
+                        }}
+                      />
+                    </div>
+                  </div>
+                )}
+
+                {calibrationPhase === "countdown" && (
+                  <p className="mt-4 text-xs text-muted">
+                    Starting in {countdown}…
+                  </p>
+                )}
+                {calibrationPhase === "saving" && (
+                  <p className="mt-4 text-xs text-muted">Saving reference…</p>
+                )}
+                {calibrationPhase === "saved" && calibrationMessage && (
+                  <p className="mt-4 text-xs text-success">
+                    {calibrationMessage} Try the gesture now.
+                  </p>
+                )}
+                {calibrationPhase === "error" && calibrationMessage && (
+                  <p className="mt-4 text-xs text-alert">{calibrationMessage}</p>
+                )}
+              </div>
+            )}
+
+            {mode === "sign_language" ? (
+              <SignCommunicator
+                voiceUnlocked={voiceUnlocked}
+                speaking={speaking}
+                speakingTarget={speakingTarget}
+                polishing={polishing}
+                replyLoading={replyLoading}
+                replyError={replyError}
+                replySource={replySource}
+                tokens={sentenceTokens}
+                sentence={signedWordsPreview}
+                lastSpoken={lastSpokenSentence}
+                userSentence={userSentence}
+                assistantReply={assistantReply}
+                conversation={conversation}
+                currentMeaning={
+                  gestureFeedback?.correct ? (gestureFeedback.meaning ?? null) : null
+                }
+                currentLabel={
+                  gestureFeedback &&
+                  gestureFeedback.gesture !== "none" &&
+                  gestureFeedback.gesture in GESTURE_LABELS
+                    ? GESTURE_LABELS[gestureFeedback.gesture as CalibrationGesture]
+                    : null
+                }
+                recognized={Boolean(gestureFeedback?.correct)}
+                scorePercent={scorePercent}
+                motionProgress={motionProgress}
+                motionHint={motionHint}
+                handStyle={handStyle}
+                onEnableVoice={() => {
+                  setVoiceUnlocked(true);
+                  if (typeof window !== "undefined" && "speechSynthesis" in window) {
+                    window.speechSynthesis.getVoices();
+                  }
+                  unlockSpeechSynthesis({
+                    onStart: () => setSpeaking(true),
+                    onEnd: () => setSpeaking(false),
+                  });
+                }}
+                onSpeak={() => {
+                  if (finalizeInFlightRef.current) return;
+                  void speakWithGrammarPolish([...sentenceTokensRef.current]);
+                }}
+                onUndo={undoLastWord}
+                onRepeat={() => {
+                  const text = userSentence || lastSpokenSentence;
+                  if (
+                    !text ||
+                    speaking ||
+                    polishing ||
+                    replyLoading ||
+                    finalizeInFlightRef.current
+                  ) {
+                    return;
+                  }
+                  pendingAssistantSpeechRef.current = null;
+                  speakingTargetRef.current = "user";
+                  setSpeakingTarget("user");
+                  speakSentence(text, {
+                    onStart: () => setSpeaking(true),
+                    onEnd: () => {
+                      setSpeaking(false);
+                      speakingTargetRef.current = null;
+                      setSpeakingTarget(null);
+                    },
+                  });
+                }}
+                onRepeatReply={() => {
+                  if (
+                    !assistantReply ||
+                    speaking ||
+                    polishing ||
+                    replyLoading ||
+                    finalizeInFlightRef.current
+                  ) {
+                    return;
+                  }
+                  pendingAssistantSpeechRef.current = null;
+                  speakAssistantReply(assistantReply);
+                }}
+                onClear={resetSentenceBuilder}
+                onNewConversation={startNewConversation}
+                onTopicChip={(sentence, tokens) => {
+                  void submitTopicChip(sentence, tokens);
+                }}
+                lexiconMode={lexiconMode}
+                onLexiconModeChange={setLexiconMode}
+                lexiconStatusNote={lexiconStatusNote}
+              />
+            ) : (
+              <div className="panel fade-up p-5 sm:p-6">
+                <p className="soft-label">Current result</p>
+                {!gestureFeedback ? (
+                  <p className="mt-3 text-sm leading-relaxed text-muted">
+                    Move into Exit Pointing or Seatbelt Demo. Feedback appears
+                    while you are actively training — not while standing still.
+                  </p>
+                ) : gestureFeedback.gesture === "none" ? (
+                  <div className="mt-3">
+                    <h2 className="font-heading text-2xl font-medium text-ink-soft">
+                      Ready when you move
+                    </h2>
+                    <p className="mt-2 text-sm leading-relaxed text-muted">
+                      Raise both arms for Exit Pointing, or slide both hands
+                      together at your waist for Seatbelt Demo.
+                    </p>
+                  </div>
+                ) : (
+                  <>
+                    <h2 className="font-heading mt-2 text-2xl font-medium text-ink">
+                      {
+                        GESTURE_LABELS[
+                          gestureFeedback.gesture as CalibrationGesture
+                        ]
+                      }
+                    </h2>
+                    <div
+                      className={`mt-4 inline-flex rounded-full px-4 py-2 text-sm font-semibold text-white ${
+                        gestureFeedback.correct ? "bg-success" : "bg-alert"
+                      }`}
+                    >
+                      {gestureFeedback.correct
+                        ? "Correct — keep going"
+                        : "You're doing it wrong"}
+                    </div>
+                    {typeof gestureFeedback.coaching_text === "string" &&
+                      gestureFeedback.coaching_text && (
+                        <p className="mt-4 text-sm leading-relaxed text-muted">
+                          {gestureFeedback.coaching_text}
+                        </p>
+                      )}
+                  </>
+                )}
+              </div>
+            )}
+
+            <div className="panel-tight overflow-hidden">
+              <button
+                type="button"
+                onClick={() => setDebugOpen((open) => !open)}
+                className="flex w-full items-center justify-between px-4 py-3 text-left text-sm text-muted transition-colors hover:bg-ink/5 hover:text-ink"
+              >
+                <span>Developer details</span>
+                <span>{debugOpen ? "Hide" : "Show"}</span>
+              </button>
+              {debugOpen && (
+                <div className="border-t border-ink/10 px-4 py-3">
+                  <p className="mb-3 text-xs text-muted">
+                    Last round-trip time:{" "}
+                    {lastRoundTripMs !== null ? `${lastRoundTripMs} ms` : "—"}
+                  </p>
+                  <p className="mb-2 text-xs font-medium text-ink">
+                    Scoring response
+                  </p>
+                  <pre className="mb-4 max-h-40 overflow-auto font-mono text-xs leading-relaxed text-muted">
+                    {scoreDebug
+                      ? JSON.stringify(scoreDebug, null, 2)
+                      : "Waiting for scoring response…"}
+                  </pre>
+                  {scoreDebug &&
+                    typeof scoreDebug.scores === "object" &&
+                    scoreDebug.scores !== null && (
+                      <>
+                        <p className="mb-2 text-xs font-medium text-ink">
+                          Per-sign scores
+                        </p>
+                        <pre className="mb-4 max-h-40 overflow-auto font-mono text-xs leading-relaxed text-muted">
+                          {JSON.stringify(scoreDebug.scores, null, 2)}
+                        </pre>
+                      </>
+                    )}
+                  <p className="mb-2 text-xs font-medium text-ink">Landmarks</p>
+                  <pre className="max-h-48 overflow-auto font-mono text-xs leading-relaxed text-muted">
+                    {debugLandmarks
+                      ? JSON.stringify(debugLandmarks, null, 2)
+                      : "Waiting for landmarks…"}
+                  </pre>
+                </div>
+              )}
+            </div>
+          </aside>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <main className="mx-auto flex w-full max-w-5xl flex-1 flex-col items-center gap-10 px-6 pb-20 pt-14 sm:pt-16">
+      <div className="fade-up flex w-full items-center justify-between gap-4">
+        <div className="flex items-center gap-3">
+          <span
+            className="flex h-10 w-10 items-center justify-center rounded-xl bg-accent text-base font-bold text-white"
+            aria-hidden
+          >
+            G
+          </span>
+          <div>
+            <p className="font-heading text-2xl font-medium text-ink sm:text-3xl">
+              Gesture
+            </p>
+            <p className="text-xs text-muted">Sign language communication</p>
+          </div>
+        </div>
+        <Link href="/history" className="nav-pill">
+          History
+        </Link>
+      </div>
+
+      <section className="fade-up flex w-full max-w-2xl flex-col items-center text-center">
+        <h1 className="font-heading text-4xl font-medium leading-tight tracking-tight text-ink sm:text-5xl">
+          Talk with your hands
+        </h1>
+        <p className="mt-4 max-w-xl text-base leading-relaxed text-muted sm:text-lg">
+          Sign naturally to build a message. We&apos;ll help you speak it and
+          continue the conversation.
+        </p>
+      </section>
+
+      <section className="fade-up flex w-full flex-col gap-4">
+        <p className="soft-label text-center">Choose a mode</p>
+        <div className="grid w-full gap-4 sm:grid-cols-2">
+          <button
+            type="button"
+            onClick={() => setMode("sign_language")}
+            className={`mode-card ${
+              mode === "sign_language" ? "mode-card-active" : ""
+            }`}
+          >
+            <span className="soft-label text-accent-deep">Recommended</span>
+            <span className="font-heading mt-2 block text-2xl font-medium text-ink">
+              Sign Language
+            </span>
+            <span className="mt-2 block text-sm leading-relaxed text-muted">
+              Show signs one after another. They become a sentence, then you can
+              speak and get a reply.
+            </span>
+          </button>
+          <button
+            type="button"
+            onClick={() => setMode("aviation")}
+            className={`mode-card ${mode === "aviation" ? "mode-card-active" : ""}`}
+          >
+            <span className="soft-label">Practice</span>
+            <span className="font-heading mt-2 block text-2xl font-medium text-ink">
+              Aviation Training
+            </span>
+            <span className="mt-2 block text-sm leading-relaxed text-muted">
+              Practice standard hand signals used on the flight deck and ramp.
+            </span>
+          </button>
+        </div>
+        <p className="text-center text-sm text-muted">
+          Selected: <span className="font-semibold text-ink">{modeLabel}</span>
+        </p>
+      </section>
+
+      <section className="fade-up flex w-full flex-col items-center gap-5">
+        <button
+          type="button"
+          onClick={startWebcam}
+          className="btn-primary min-w-[12rem] px-8 text-base"
+        >
+          Enable Webcam
+        </button>
+
+        {!poseReady && !handReady && !modelError && (
+          <p className="text-sm text-muted">Loading detection models…</p>
+        )}
+        {modelError && <p className="text-sm text-alert">{modelError}</p>}
+        {cameraError && (
+          <div className="panel max-w-md border-alert/25 bg-alert/5 px-4 py-3 text-center text-sm text-alert">
+            {cameraError}
+          </div>
+        )}
+      </section>
+    </main>
+  );
+}

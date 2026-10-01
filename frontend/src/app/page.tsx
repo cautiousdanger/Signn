@@ -1161,9 +1161,6 @@ export default function Home() {
 
   useEffect(() => {
     if (lexiconMode === "aac") {
-      setLexiconStatusNote(
-        "AAC gestures are live. Sign normally, or tap a quick topic.",
-      );
       return;
     }
     let cancelled = false;
@@ -1295,16 +1292,18 @@ export default function Home() {
       wsRef.current?.close();
       wsRef.current = null;
       pendingSendAtRef.current.clear();
-      setWsStatus("idle");
-      setLastRoundTripMs(null);
-      setGestureFeedback(null);
-      setLimbsNotVisible(false);
-      setScoreDebug(null);
-      setCoachingText(null);
-      setCoachingLoading(false);
-      setSpeaking(false);
-      pendingSpeakRef.current = null;
-      resetSentenceBuilder();
+      queueMicrotask(() => {
+        setWsStatus("idle");
+        setLastRoundTripMs(null);
+        setGestureFeedback(null);
+        setLimbsNotVisible(false);
+        setScoreDebug(null);
+        setCoachingText(null);
+        setCoachingLoading(false);
+        setSpeaking(false);
+        pendingSpeakRef.current = null;
+        resetSentenceBuilder();
+      });
       return;
     }
 
@@ -1662,6 +1661,8 @@ export default function Home() {
       wsRef.current?.close();
       if (wsRef.current) wsRef.current = null;
     };
+    // resetSentenceBuilder is a stable session reset; omitting avoids reconnect churn.
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- streaming lifecycle only
   }, [isStreaming]);
 
   // If coaching never arrives (API hang / dropped follow-up), fall back after 5s.
@@ -1676,15 +1677,19 @@ export default function Home() {
 
   // Clear live results when switching modes so pose/hand state can't stick.
   useEffect(() => {
-    setGestureFeedback(null);
-    setCoachingText(null);
-    setCoachingLoading(false);
-    setScoreDebug(null);
-    setLimbsNotVisible(false);
-    setSpeaking(false);
-    setMotionProgress(null);
-    setMotionHint(null);
-    setHandStyle(null);
+    queueMicrotask(() => {
+      setGestureFeedback(null);
+      setCoachingText(null);
+      setCoachingLoading(false);
+      setScoreDebug(null);
+      setLimbsNotVisible(false);
+      setSpeaking(false);
+      setMotionProgress(null);
+      setMotionHint(null);
+      setHandStyle(null);
+      pendingSpeakRef.current = null;
+      resetSentenceBuilder();
+    });
     indexTrailRef.current = [];
     fingertipTrailRef.current = [];
     handStyleRef.current = null;
@@ -1692,12 +1697,11 @@ export default function Home() {
       clearTimeout(motionHintTimerRef.current);
       motionHintTimerRef.current = null;
     }
-    pendingSpeakRef.current = null;
-    resetSentenceBuilder();
     lastDetectTimeRef.current = -1;
     const canvas = canvasRef.current;
     const ctx = canvas?.getContext("2d");
     if (canvas && ctx) ctx.clearRect(0, 0, canvas.width, canvas.height);
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- clear on mode change only
   }, [mode]);
 
   useEffect(() => {
@@ -1712,11 +1716,13 @@ export default function Home() {
       const ctx = canvas?.getContext("2d");
       if (canvas && ctx) ctx.clearRect(0, 0, canvas.width, canvas.height);
       if (!isStreaming) {
-        setDebugLandmarks(null);
-        setLimbsNotVisible(false);
-        setScoreDebug(null);
-        setCoachingText(null);
-        setCoachingLoading(false);
+        queueMicrotask(() => {
+          setDebugLandmarks(null);
+          setLimbsNotVisible(false);
+          setScoreDebug(null);
+          setCoachingText(null);
+          setCoachingLoading(false);
+        });
         lastDetectTimeRef.current = -1;
         lastWsSendRef.current = 0;
       }
@@ -2224,7 +2230,7 @@ export default function Home() {
     }
   }
 
-  async function useRulesAgain() {
+  async function switchToRulesAgain() {
     setTrainError(null);
     setTrainBusy(true);
     try {
@@ -2454,14 +2460,6 @@ export default function Home() {
 
   const modeLabel =
     mode === "aviation" ? "Aviation Training" : "Sign Language";
-  const sessionSubtitle =
-    mode === "aviation"
-      ? gestureFeedback &&
-        gestureFeedback.gesture !== "none" &&
-        gestureFeedback.gesture in GESTURE_LABELS
-        ? GESTURE_LABELS[gestureFeedback.gesture as CalibrationGesture]
-        : "Exit Pointing"
-      : signedWordsPreview || lastSpokenSentence || "Talk with signs";
   const scorePercent =
     gestureFeedback && gestureFeedback.gesture !== "none"
       ? Math.round(Math.max(0, Math.min(1, gestureFeedback.score)) * 100)
@@ -2473,79 +2471,126 @@ export default function Home() {
   const liveTest = liveTestFromDebug(scoreDebug);
 
   if (isStreaming) {
+    const connectionLabel =
+      wsStatus === "connected"
+        ? "Connected"
+        : wsStatus === "connecting"
+          ? "Connecting…"
+          : wsStatus === "reconnecting"
+            ? "Reconnecting…"
+            : "Offline";
+    const connectionTone =
+      wsStatus === "connected"
+        ? "status-pill-ok"
+        : wsStatus === "connecting" || wsStatus === "reconnecting"
+          ? "status-pill-warn"
+          : "status-pill-bad";
+    const cameraLiveLabel = limbsNotVisible
+      ? mode === "sign_language"
+        ? "Move closer"
+        : "Step back"
+      : "Camera ready";
+    const detectedOverlay =
+      mode === "sign_language" &&
+      gestureFeedback &&
+      gestureFeedback.gesture !== "none"
+        ? gestureFeedback.correct && gestureFeedback.meaning
+          ? `Detected: ${gestureFeedback.meaning}`
+          : gestureFeedback.gesture in GESTURE_LABELS
+            ? `Seeing: ${GESTURE_LABELS[gestureFeedback.gesture as CalibrationGesture]}`
+            : "Recognizing…"
+        : null;
+    const showWelcome =
+      mode === "sign_language" &&
+      conversation.length === 0 &&
+      !userSentence &&
+      !assistantReply &&
+      sentenceTokens.length === 0;
+
     return (
-      <div className="flex min-h-full flex-1 flex-col">
-        <header className="flex flex-wrap items-center gap-2.5 border-b border-ink/8 bg-surface/80 px-4 py-3 backdrop-blur-md sm:gap-3 sm:px-6">
-          <div className="min-w-0 flex-1 basis-[12rem]">
-            <p className="soft-label !normal-case !tracking-normal">Gesture</p>
-            <h1 className="font-heading truncate text-lg font-medium text-ink sm:text-xl">
-              {modeLabel}
-              <span className="text-muted"> — {sessionSubtitle}</span>
-            </h1>
+      <div className="app-shell">
+        <header className="app-topbar">
+          <div className="min-w-0 flex-1 basis-[11rem]">
+            <div className="flex items-center gap-2.5">
+              <span
+                className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-accent text-sm font-bold text-white"
+                aria-hidden
+              >
+                G
+              </span>
+              <div className="min-w-0">
+                <p className="truncate font-heading text-lg font-medium leading-tight text-ink">
+                  Gesture
+                </p>
+                <p className="truncate text-xs text-muted">
+                  {mode === "sign_language"
+                    ? "Sign language communication"
+                    : "Aviation practice"}
+                </p>
+              </div>
+            </div>
           </div>
-          <button
-            type="button"
-            onClick={() => setRulebookOpen((open) => !open)}
-            className={`nav-pill shrink-0 ${rulebookOpen ? "nav-pill-active" : ""}`}
-          >
-            Signs
-          </button>
-          <button
-            type="button"
-            onClick={() => setCalibrationOpen((open) => !open)}
-            className={`nav-pill shrink-0 ${calibrationOpen ? "nav-pill-active" : ""}`}
-          >
-            Record
-          </button>
-          {mode === "sign_language" && (
+
+          <div className="topbar-tools">
+            {mode === "sign_language" && (
+              <button
+                type="button"
+                onClick={() => setRulebookOpen((open) => !open)}
+                className={`nav-pill shrink-0 ${rulebookOpen ? "nav-pill-active" : ""}`}
+              >
+                Signs
+              </button>
+            )}
             <button
               type="button"
-              onClick={() => setTrainOpen((open) => !open)}
-              className={`nav-pill shrink-0 ${trainOpen ? "nav-pill-active" : ""}`}
+              onClick={() => setCalibrationOpen((open) => !open)}
+              className={`nav-pill shrink-0 ${calibrationOpen ? "nav-pill-active" : ""}`}
             >
-              Train
+              Record
             </button>
-          )}
-          <button
-            type="button"
-            onClick={stopWebcam}
-            className="nav-pill shrink-0"
-          >
-            Change mode
-          </button>
-          <Link href="/history" className="nav-pill shrink-0">
-            History
-          </Link>
-          <div
-            className={`flex shrink-0 items-center gap-2 rounded-full border px-3 py-1.5 text-xs font-semibold ${
-              wsStatus === "connected"
-                ? "border-success/25 bg-success/10 text-success"
-                : wsStatus === "connecting" || wsStatus === "reconnecting"
-                  ? "border-accent/25 bg-accent/10 text-accent"
-                  : "border-alert/25 bg-alert/10 text-alert"
-            }`}
-          >
-            <span
-              className={`status-dot ${
-                wsStatus === "connected"
-                  ? "bg-success"
-                  : wsStatus === "connecting" || wsStatus === "reconnecting"
-                    ? "bg-accent pulse-soft"
-                    : "bg-alert"
-              }`}
-              aria-hidden
-            />
-            {wsStatus === "connected"
-              ? "Live"
-              : wsStatus === "connecting"
-                ? "Connecting…"
-                : wsStatus === "reconnecting"
-                  ? "Reconnecting…"
-                  : "Offline"}
+            {mode === "sign_language" && (
+              <button
+                type="button"
+                onClick={() => setTrainOpen((open) => !open)}
+                className={`nav-pill shrink-0 ${trainOpen ? "nav-pill-active" : ""}`}
+              >
+                Train
+              </button>
+            )}
+            <button
+              type="button"
+              onClick={stopWebcam}
+              className="nav-pill shrink-0"
+            >
+              Change mode
+            </button>
+            <Link href="/history" className="nav-pill shrink-0">
+              History
+            </Link>
+            <div className={`status-pill shrink-0 ${connectionTone}`} role="status">
+              <span
+                className={`status-dot ${
+                  wsStatus === "connected"
+                    ? "bg-success"
+                    : wsStatus === "connecting" || wsStatus === "reconnecting"
+                      ? "bg-accent pulse-soft"
+                      : "bg-alert"
+                }`}
+                aria-hidden
+              />
+              {connectionLabel}
+            </div>
           </div>
         </header>
 
-        <div className="relative flex flex-1 flex-col gap-4 p-4 lg:flex-row lg:items-start lg:gap-6 lg:p-6">
+        {showWelcome ? (
+          <p className="sr-only">
+            Ready to communicate. Sign naturally. We&apos;ll recognize your signs
+            and help you express them.
+          </p>
+        ) : null}
+
+        <div className="workspace relative">
           {mode === "sign_language" && (
             <SignRulebook
               open={rulebookOpen}
@@ -2566,8 +2611,9 @@ export default function Home() {
               }}
             />
           )}
-          <div className="relative flex min-w-0 w-full flex-1 items-center justify-center">
-            <div className="hud-frame relative aspect-video w-full max-w-[min(90vw,calc((100vh-7.5rem)*16/9))] max-h-[calc(100vh-7.5rem)] bg-ink lg:w-[min(85vw,calc((100vh-7.5rem)*16/9))]">
+
+          <div className="workspace-camera">
+            <div className="hud-frame relative aspect-video w-full bg-ink">
               <div className="hud-corners" aria-hidden />
               <div className="safe-zone" aria-hidden />
               <video
@@ -2581,8 +2627,23 @@ export default function Home() {
                 ref={canvasRef}
                 className="pointer-events-none absolute inset-0 h-full w-full object-contain"
               />
+              <div className="camera-badge left-3 top-3">
+                <span
+                  className={`status-dot ${
+                    limbsNotVisible ? "bg-alert" : "bg-success"
+                  }`}
+                  aria-hidden
+                />
+                {cameraLiveLabel}
+              </div>
+              {detectedOverlay ? (
+                <div className="camera-detect" aria-live="polite">
+                  {detectedOverlay}
+                </div>
+              ) : null}
+
               {limbsNotVisible && (
-                <div className="pointer-events-none absolute left-1/2 top-4 z-10 -translate-x-1/2 rounded-full bg-alert px-4 py-2 text-xs font-semibold text-white shadow-lg">
+                <div className="pointer-events-none absolute left-1/2 top-14 z-10 -translate-x-1/2 rounded-full bg-alert px-4 py-2 text-xs font-semibold text-white">
                   {mode === "sign_language"
                     ? "Move closer — hand not fully visible"
                     : "Move back — arms not fully visible"}
@@ -2598,32 +2659,27 @@ export default function Home() {
                     Get into position —{" "}
                     {calibrationGesture
                       ? GESTURE_LABELS[calibrationGesture]
-                      : ""}
+                      : "gesture"}
                   </span>
                 </div>
               )}
-
               {calibrationPhase === "recording" && (
-                <div className="pointer-events-none absolute inset-x-0 top-4 z-20 mx-auto w-64 overflow-hidden rounded-full">
-                  <div className="flex items-center justify-center gap-2 bg-alert px-3 py-1.5 text-xs font-semibold text-white">
-                    <span
-                      className="status-dot bg-white pulse-soft"
-                      aria-hidden
-                    />
-                    Recording…
-                  </div>
-                  <div className="h-1.5 w-full bg-white/30">
-                    <div
-                      className="h-full bg-white"
-                      style={{ width: `${Math.round(recordProgress * 100)}%` }}
-                    />
+                <div className="pointer-events-none absolute inset-x-0 bottom-16 z-20 flex justify-center">
+                  <div className="rounded-full bg-alert px-4 py-2 text-xs font-semibold text-white">
+                    Recording… {Math.round(recordProgress * 100)}%
                   </div>
                 </div>
               )}
             </div>
+            {mode === "sign_language" ? (
+              <p className="px-1 text-xs leading-relaxed text-muted">
+                Good lighting helps recognition. Sign one word at a time, then
+                hold still.
+              </p>
+            ) : null}
           </div>
 
-          <aside className="flex w-full shrink-0 flex-col gap-4 lg:w-96 xl:w-[26rem]">
+          <aside className="workspace-side">
             {mode === "sign_language" && (
               <SignTrainer
                 open={trainOpen}
@@ -2646,7 +2702,7 @@ export default function Home() {
                   void promoteSignModel();
                 }}
                 onUseRules={() => {
-                  void useRulesAgain();
+                  void switchToRulesAgain();
                 }}
               />
             )}
@@ -2859,130 +2915,133 @@ export default function Home() {
                 }}
                 lexiconMode={lexiconMode}
                 onLexiconModeChange={setLexiconMode}
-                lexiconStatusNote={lexiconStatusNote}
+                lexiconStatusNote={
+                  lexiconMode === "aac"
+                    ? "AAC gestures are live. Sign normally, or tap a quick topic."
+                    : lexiconStatusNote
+                }
               />
             ) : (
-            <div className="panel fade-up p-5 sm:p-6">
-              <p className="soft-label">Current result</p>
-              {!gestureFeedback ? (
-                <p className="mt-3 text-sm leading-relaxed text-muted">
-                  Move into Exit Pointing or Seatbelt Demo. Feedback appears
-                  while you are actively training — not while standing still.
-                </p>
-              ) : gestureFeedback.gesture === "none" ? (
-                <div className="mt-3">
-                  <h2 className="font-heading text-2xl font-medium text-ink-soft">
-                    Ready when you move
-                  </h2>
-                  <p className="mt-2 text-sm leading-relaxed text-muted">
-                    Raise both arms for Exit Pointing, or slide both hands
-                    together at your waist for Seatbelt Demo.
-                  </p>
-                </div>
-              ) : (
-                <>
-                  <h2 className="font-heading mt-2 text-2xl font-medium text-ink">
-                    {
-                      GESTURE_LABELS[
-                        gestureFeedback.gesture as CalibrationGesture
-                      ]
-                    }
-                  </h2>
-                  <div
-                    className={`mt-4 inline-flex rounded-full px-4 py-2 text-sm font-semibold text-white ${
-                      gestureFeedback.correct ? "bg-success" : "bg-alert"
-                    }`}
-                  >
-                    {gestureFeedback.correct
-                      ? "Correct — keep going"
-                      : "You're doing it wrong"}
-                  </div>
+              <div className="panel fade-up p-5 sm:p-6">
+                <p className="soft-label">Current result</p>
+                {!gestureFeedback ? (
                   <p className="mt-3 text-sm leading-relaxed text-muted">
-                    {gestureFeedback.correct
-                      ? gestureFeedback.gesture === "seatbelt_demo"
-                        ? "Finish the waist slide smoothly."
-                        : "Hold the line — elbows nearly straight, wrists level."
-                      : coachingText ||
-                        gestureFeedback.hints?.[0] ||
-                        "Adjust toward the target zone."}
+                    Move into Exit Pointing or Seatbelt Demo. Feedback appears
+                    while you are actively training — not while standing still.
                   </p>
-                  <div className="mt-5">
-                    <div className="mb-2 flex items-center justify-between text-sm">
-                      <span className="text-muted">Confidence</span>
-                      <span className="font-semibold text-ink">
-                        {scorePercent}%
-                      </span>
-                    </div>
-                    <div className="progress-track">
-                      <div
-                        className={`progress-fill ${
-                          gestureFeedback.correct ? "bg-success" : "bg-alert"
-                        }`}
-                        style={{ width: `${scorePercent}%` }}
-                      />
-                    </div>
+                ) : gestureFeedback.gesture === "none" ? (
+                  <div className="mt-3">
+                    <h2 className="font-heading text-2xl font-medium text-ink-soft">
+                      Ready when you move
+                    </h2>
+                    <p className="mt-2 text-sm leading-relaxed text-muted">
+                      Raise both arms for Exit Pointing, or slide both hands
+                      together at your waist for Seatbelt Demo.
+                    </p>
                   </div>
-                  {gestureFeedback.gesture === "exit_pointing" && (
-                    <dl className="mt-5 grid grid-cols-2 gap-x-3 gap-y-2 text-xs text-muted">
-                      <div>
-                        <dt>Left arm</dt>
-                        <dd className="font-mono text-ink">
-                          {gestureFeedback.left_arm_angle ?? "—"}°
-                        </dd>
+                ) : (
+                  <>
+                    <h2 className="font-heading mt-2 text-2xl font-medium text-ink">
+                      {
+                        GESTURE_LABELS[
+                          gestureFeedback.gesture as CalibrationGesture
+                        ]
+                      }
+                    </h2>
+                    <div
+                      className={`mt-4 inline-flex rounded-full px-4 py-2 text-sm font-semibold text-white ${
+                        gestureFeedback.correct ? "bg-success" : "bg-alert"
+                      }`}
+                    >
+                      {gestureFeedback.correct
+                        ? "Correct — keep going"
+                        : "You're doing it wrong"}
+                    </div>
+                    <p className="mt-3 text-sm leading-relaxed text-muted">
+                      {gestureFeedback.correct
+                        ? gestureFeedback.gesture === "seatbelt_demo"
+                          ? "Finish the waist slide smoothly."
+                          : "Hold the line — elbows nearly straight, wrists level."
+                        : coachingText ||
+                          gestureFeedback.hints?.[0] ||
+                          "Adjust toward the target zone."}
+                    </p>
+                    <div className="mt-5">
+                      <div className="mb-2 flex items-center justify-between text-sm">
+                        <span className="text-muted">Confidence</span>
+                        <span className="font-semibold text-ink">
+                          {scorePercent}%
+                        </span>
                       </div>
-                      <div>
-                        <dt>Right arm</dt>
-                        <dd className="font-mono text-ink">
-                          {gestureFeedback.right_arm_angle ?? "—"}°
-                        </dd>
+                      <div className="progress-track">
+                        <div
+                          className={`progress-fill ${
+                            gestureFeedback.correct ? "bg-success" : "bg-alert"
+                          }`}
+                          style={{ width: `${scorePercent}%` }}
+                        />
                       </div>
-                      <div>
-                        <dt>Target</dt>
-                        <dd className="font-mono text-ink">
-                          {gestureFeedback.target_angle ?? "—"}°
-                        </dd>
-                      </div>
-                      <div>
-                        <dt>Comfort zone</dt>
-                        <dd className="font-mono text-ink">
-                          ±
-                          {gestureFeedback.pass_band_deg ??
-                            gestureFeedback.tolerance ??
-                            "—"}
-                          °
-                        </dd>
-                      </div>
-                    </dl>
-                  )}
-
-                  {!gestureFeedback.correct &&
-                    (coachingLoading || coachingText) && (
-                      <div className="mt-5 rounded-[0.9rem] border border-accent/25 bg-accent-soft/50 px-4 py-3">
-                        <p className="soft-label text-accent-deep">Coaching</p>
-                        {coachingLoading && !coachingText ? (
-                          <p className="mt-1.5 text-sm text-muted">
-                            Getting feedback…
-                          </p>
-                        ) : (
-                          <p className="mt-1.5 text-sm leading-relaxed text-ink">
-                            {coachingText}
-                          </p>
-                        )}
-                      </div>
+                    </div>
+                    {gestureFeedback.gesture === "exit_pointing" && (
+                      <dl className="mt-5 grid grid-cols-2 gap-x-3 gap-y-2 text-xs text-muted">
+                        <div>
+                          <dt>Left arm</dt>
+                          <dd className="font-mono text-ink">
+                            {gestureFeedback.left_arm_angle ?? "—"}°
+                          </dd>
+                        </div>
+                        <div>
+                          <dt>Right arm</dt>
+                          <dd className="font-mono text-ink">
+                            {gestureFeedback.right_arm_angle ?? "—"}°
+                          </dd>
+                        </div>
+                        <div>
+                          <dt>Target</dt>
+                          <dd className="font-mono text-ink">
+                            {gestureFeedback.target_angle ?? "—"}°
+                          </dd>
+                        </div>
+                        <div>
+                          <dt>Comfort zone</dt>
+                          <dd className="font-mono text-ink">
+                            ±
+                            {gestureFeedback.pass_band_deg ??
+                              gestureFeedback.tolerance ??
+                              "—"}
+                            °
+                          </dd>
+                        </div>
+                      </dl>
                     )}
-                </>
-              )}
-            </div>
+                    {!gestureFeedback.correct &&
+                      (coachingLoading || coachingText) && (
+                        <div className="mt-5 rounded-[0.9rem] border border-accent/25 bg-accent-soft/50 px-4 py-3">
+                          <p className="soft-label text-accent-deep">Coaching</p>
+                          {coachingLoading && !coachingText ? (
+                            <p className="mt-1.5 text-sm text-muted">
+                              Getting feedback…
+                            </p>
+                          ) : (
+                            <p className="mt-1.5 text-sm leading-relaxed text-ink">
+                              {coachingText}
+                            </p>
+                          )}
+                        </div>
+                      )}
+                  </>
+                )}
+              </div>
             )}
 
-            <div className="border border-ink/15 bg-surface">
+            <div className="panel-tight overflow-hidden">
               <button
                 type="button"
                 onClick={() => setDebugOpen((open) => !open)}
-                className="flex w-full items-center justify-between px-4 py-3 text-left text-sm text-ink transition-colors hover:bg-ink/5"
+                className="flex w-full items-center justify-between px-4 py-3 text-left text-sm text-muted transition-colors hover:bg-ink/5 hover:text-ink"
               >
-                <span>Debug data</span>
-                <span className="text-muted">{debugOpen ? "Hide" : "Show"}</span>
+                <span>Developer details</span>
+                <span>{debugOpen ? "Hide" : "Show"}</span>
               </button>
               {debugOpen && (
                 <div className="border-t border-ink/10 px-4 py-3">
@@ -3026,11 +3085,22 @@ export default function Home() {
   }
 
   return (
-    <main className="mx-auto flex w-full max-w-5xl flex-1 flex-col items-center gap-12 px-6 pb-20 pt-16 sm:pt-20">
+    <main className="mx-auto flex w-full max-w-5xl flex-1 flex-col items-center gap-10 px-6 pb-20 pt-14 sm:pt-16">
       <div className="fade-up flex w-full items-center justify-between gap-4">
-        <p className="font-heading text-2xl font-medium text-ink sm:text-3xl">
-          Gesture
-        </p>
+        <div className="flex items-center gap-3">
+          <span
+            className="flex h-10 w-10 items-center justify-center rounded-xl bg-accent text-base font-bold text-white"
+            aria-hidden
+          >
+            G
+          </span>
+          <div>
+            <p className="font-heading text-2xl font-medium text-ink sm:text-3xl">
+              Gesture
+            </p>
+            <p className="text-xs text-muted">Sign language communication</p>
+          </div>
+        </div>
         <Link href="/history" className="nav-pill">
           History
         </Link>
@@ -3041,8 +3111,8 @@ export default function Home() {
           Talk with your hands
         </h1>
         <p className="mt-4 max-w-xl text-base leading-relaxed text-muted sm:text-lg">
-          Show signs to build a sentence, then hear it spoken out loud — calm
-          and clear for everyday communication.
+          Sign naturally to build a message. We&apos;ll help you speak it and
+          continue the conversation.
         </p>
       </section>
 
@@ -3061,8 +3131,8 @@ export default function Home() {
               Sign Language
             </span>
             <span className="mt-2 block text-sm leading-relaxed text-muted">
-              Show signs one after another. They become a sentence, then the
-              computer speaks it.
+              Show signs one after another. They become a sentence, then you can
+              speak and get a reply.
             </span>
           </button>
           <button

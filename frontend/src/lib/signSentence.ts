@@ -185,7 +185,6 @@ const PAIR_CLAUSES: Partial<Record<string, string>> = {
   "Tomorrow|Doctor": "I need a doctor tomorrow",
   "Today|Help": "I need help today",
   "Tomorrow|Help": "I need help tomorrow",
-  "I|Want|Food": "I want food",
   "Today|Food": "I need food today",
   "Tomorrow|Water": "I need water tomorrow",
   "Thank you|Goodbye": "Thank you. Goodbye",

@@ -13,9 +13,9 @@ const fraunces = Fraunces({
 });
 
 export const metadata: Metadata = {
-  title: "Gesture — Sign Language Talk",
+  title: "Gesture — Sign language communication",
   description:
-    "Show signs, build a sentence, and hear it spoken — calm AAC for everyday talk",
+    "Sign naturally to build a message, speak it aloud, and continue the conversation.",
   icons: {
     icon: [{ url: "/favicon.svg", type: "image/svg+xml" }],
   },
